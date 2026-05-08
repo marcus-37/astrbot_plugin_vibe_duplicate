@@ -1,0 +1,2 @@
+"""Vibe Duplicate AstrBot plugin."""
+
