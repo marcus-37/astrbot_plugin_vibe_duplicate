@@ -2,5 +2,5 @@ name: astrbot_plugin_vibe_duplicate
 display_name: Vibe Duplicate
 desc: Long-term persona learning with dynamic RAG style injection for AstrBot.
 version: v2.0.0
-author: marcus-37
+author: codex using by marcus-37
 repo: https://github.com/marcus-37/astrbot_plugin_vibe_duplicate/tree/master

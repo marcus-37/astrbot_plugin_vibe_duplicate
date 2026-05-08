@@ -51,6 +51,8 @@
 
 ## 常用配置项
 
+插件目录内已提供 `_conf_schema.json`。重载插件后，AstrBot 后台会自动生成并展示以下配置项。
+
 - `target_users`：需要长期学习的目标用户 ID 列表。
 - `avatar_user_id`：注入 prompt 时明确要模仿的用户 ID。如果不设置，且 `target_users` 里只有一个用户，就默认使用该用户。
 - `enable_prompt_injection`：是否启用动态 prompt 注入，默认 `true`。

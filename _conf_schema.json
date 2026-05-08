@@ -1,0 +1,72 @@
+{
+  "target_users": {
+    "type": "template_list",
+    "default": [],
+    "description": "需要长期学习的目标用户 ID 列表。"
+  },
+  "avatar_user_id": {
+    "type": "string",
+    "default": "",
+    "description": "回复时要模仿的用户 ID。为空时，如果 target_users 只有一个用户，则自动使用该用户。"
+  },
+  "enable_prompt_injection": {
+    "type": "bool",
+    "default": true,
+    "description": "是否在 LLM 请求前注入 persona、相似历史发言和上下文。"
+  },
+  "persona_update_threshold": {
+    "type": "int",
+    "default": 50,
+    "description": "每累计多少条新消息触发一次 persona 增量更新。"
+  },
+  "rag_top_k": {
+    "type": "int",
+    "default": 8,
+    "description": "回复时检索多少条相似历史发言。"
+  },
+  "recent_user_context": {
+    "type": "int",
+    "default": 12,
+    "description": "注入 prompt 时附带多少条目标用户最近发言。"
+  },
+  "retrieval_scan_limit": {
+    "type": "int",
+    "default": 1000,
+    "description": "RAG 检索时最多扫描多少条历史发言。"
+  },
+  "retrieval_cache_ttl_seconds": {
+    "type": "int",
+    "default": 60,
+    "description": "相似发言检索缓存有效期，单位秒。"
+  },
+  "embedding_dimensions": {
+    "type": "int",
+    "default": 128,
+    "description": "placeholder embedding 的向量维度。后续接入真实 embedding provider 时可忽略。"
+  },
+  "write_queue_size": {
+    "type": "int",
+    "default": 1000,
+    "description": "异步消息写入队列容量。"
+  },
+  "max_message_length": {
+    "type": "int",
+    "default": 1200,
+    "description": "超过该长度的消息不进入学习。"
+  },
+  "min_message_length": {
+    "type": "int",
+    "default": 2,
+    "description": "短于该长度的消息不进入学习。"
+  },
+  "blacklist_words": {
+    "type": "template_list",
+    "default": [],
+    "description": "消息包含这些词时不进入学习。"
+  },
+  "filter_commands": {
+    "type": "bool",
+    "default": true,
+    "description": "是否过滤 /、!、# 等命令类消息。"
+  }
+}
