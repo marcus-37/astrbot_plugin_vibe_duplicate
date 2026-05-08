@@ -23,6 +23,7 @@ from data.plugins.astrbot_plugin_vibe_duplicate.embeddings import (
 from data.plugins.astrbot_plugin_vibe_duplicate.models import PendingMessage
 from data.plugins.astrbot_plugin_vibe_duplicate.rag import RagRetriever
 from data.plugins.astrbot_plugin_vibe_duplicate.storage import AvatarStore
+from data.plugins.astrbot_plugin_vibe_duplicate.style import StyleAnalyzer
 
 
 async def main() -> None:
@@ -30,6 +31,7 @@ async def main() -> None:
         store = AvatarStore(Path(tmp))
         embeddings = PlaceholderEmbeddingProvider()
         retriever = RagRetriever(store, embeddings)
+        style = StyleAnalyzer()
 
         samples = [
             "this issue is weird but still explainable",
@@ -38,6 +40,7 @@ async def main() -> None:
         ]
         for text in samples:
             embedded = await embeddings.embed(text)
+            style_profile = style.analyze(text, "demo")
             await store.add_message(
                 PendingMessage(
                     user_id="demo_user",
@@ -47,6 +50,8 @@ async def main() -> None:
                     semantic_tag="demo",
                     message_embedding=embedded.vector,
                     embedding_model=embedded.model,
+                    style_vector=style_profile.vector,
+                    quality_score=style_profile.quality_score,
                 ),
             )
 

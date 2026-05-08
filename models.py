@@ -13,6 +13,8 @@ class StoredMessage:
     semantic_tag: str
     message_embedding: list[float]
     embedding_model: str
+    style_vector: list[float]
+    quality_score: float
 
 
 @dataclass(slots=True)
@@ -24,6 +26,8 @@ class PendingMessage:
     semantic_tag: str
     message_embedding: list[float]
     embedding_model: str
+    style_vector: list[float]
+    quality_score: float
 
 
 @dataclass(slots=True)
@@ -41,4 +45,10 @@ class RetrievedExample:
     semantic_tag: str
     score: float
     timestamp: int
+    semantic_score: float = 0.0
+    recency_score: float = 0.0
+    style_match_score: float = 0.0
+    semantic_tag_score: float = 0.0
+    quality_score: float = 0.0
+    style_brief: str = ""
 

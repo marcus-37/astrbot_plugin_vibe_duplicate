@@ -11,12 +11,13 @@ from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, register
 
 from .cleaning import MessageCleaner, StyleClassifier
-from .embeddings import PlaceholderEmbeddingProvider
+from .embeddings import EmbeddingQueue, build_embedding_provider
 from .models import PendingMessage
 from .persona import PersonaUpdater
 from .prompting import build_avatar_prompt
 from .rag import RagRetriever
 from .storage import AvatarStore
+from .style import StyleAnalyzer
 
 
 DISPLAY_NAME = "Vibe Duplicate"
@@ -44,8 +45,11 @@ class VibeDuplicatePlugin(Star):
         self.context = context
         self.config = config
         self.store = AvatarStore(DATA_ROOT)
-        self.embedding_provider = PlaceholderEmbeddingProvider(
-            dimensions=int(cfg(config, "embedding_dimensions", 128)),
+        self.embedding_provider = build_embedding_provider(config, context)
+        self.embedding_queue = EmbeddingQueue(
+            self.embedding_provider,
+            batch_size=int(cfg(config, "embedding_batch_size", 16)),
+            flush_interval=float(cfg(config, "embedding_batch_flush_seconds", 0.05)),
         )
         self.cleaner = MessageCleaner(
             max_length=int(cfg(config, "max_message_length", 1200)),
@@ -54,11 +58,13 @@ class VibeDuplicatePlugin(Star):
             filter_commands=bool(cfg(config, "filter_commands", True)),
         )
         self.classifier = StyleClassifier()
+        self.style_analyzer = StyleAnalyzer()
         self.retriever = RagRetriever(
             self.store,
             self.embedding_provider,
             cache_ttl_seconds=int(cfg(config, "retrieval_cache_ttl_seconds", 60)),
             scan_limit=int(cfg(config, "retrieval_scan_limit", 1000)),
+            recall_k=int(cfg(config, "retrieval_recall_k", 50)),
         )
         self.persona_updater = PersonaUpdater(
             self.store,
@@ -77,6 +83,7 @@ class VibeDuplicatePlugin(Star):
         return [str(item) for item in cfg(self.config, "target_users", [])]
 
     async def initialize(self):
+        self.embedding_queue.start()
         self.writer_task = asyncio.create_task(self._writer_loop())
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=100)
@@ -95,16 +102,20 @@ class VibeDuplicatePlugin(Star):
             logger.debug("[VibeDuplicate] skipped duplicate message from %s", sender_id)
             return
 
-        embedding = await self.embedding_provider.embed(clean.normalized)
+        semantic_tag = self.classifier.classify(clean.normalized)
+        style_profile = self.style_analyzer.analyze(clean.normalized, semantic_tag)
+        embedding = await self.embedding_queue.embed(clean.normalized)
         timestamp = int(getattr(event.message_obj, "timestamp", 0) or time.time())
         pending = PendingMessage(
             user_id=sender_id,
             message=event.message_str.strip(),
             normalized_message=clean.normalized,
             timestamp=timestamp,
-            semantic_tag=self.classifier.classify(clean.normalized),
+            semantic_tag=semantic_tag,
             message_embedding=embedding.vector,
             embedding_model=embedding.model,
+            style_vector=style_profile.vector,
+            quality_score=style_profile.quality_score,
         )
         await self.write_queue.put(pending)
 
@@ -141,10 +152,13 @@ class VibeDuplicatePlugin(Star):
 
         current_context = self._current_context(event, request)
         profile = await self.store.get_generated_profile(user_id)
+        query_tag = self.classifier.classify(current_context or request.prompt or "")
         examples = await self.retriever.retrieve(
             user_id,
             current_context or request.prompt or "",
             top_k=int(cfg(self.config, "rag_top_k", 8)),
+            profile=profile,
+            query_tag=query_tag,
         )
         annotations = await self.store.notes(user_id, "admin_annotations", 20)
         memories = await self.store.notes(user_id, "third_party_memories", 20)
@@ -252,7 +266,14 @@ class VibeDuplicatePlugin(Star):
     @duplicate_group.command("prompt")
     async def show_prompt(self, event: AstrMessageEvent, user_id: str, *, query: str = ""):
         profile = await self.store.get_generated_profile(user_id)
-        examples = await self.retriever.retrieve(user_id, query or event.message_str, top_k=8)
+        query_text = query or event.message_str
+        examples = await self.retriever.retrieve(
+            user_id,
+            query_text,
+            top_k=8,
+            profile=profile,
+            query_tag=self.classifier.classify(query_text),
+        )
         annotations = await self.store.notes(user_id, "admin_annotations", 20)
         memories = await self.store.notes(user_id, "third_party_memories", 20)
         recent = await self.store.recent_messages(user_id, 12)
@@ -296,6 +317,7 @@ class VibeDuplicatePlugin(Star):
             await self.write_queue.put(None)
             await self.write_queue.join()
             self.writer_task.cancel()
+        await self.embedding_queue.stop()
         for task in list(self.update_tasks):
             task.cancel()
         logger.info("[VibeDuplicate] terminated")

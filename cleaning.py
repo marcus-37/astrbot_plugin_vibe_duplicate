@@ -93,15 +93,15 @@ class StyleClassifier:
 
     def classify(self, text: str) -> str:
         lowered = text.lower()
-        if any(x in lowered for x in ("笑死", "草", "哈哈", "hhh", "233", "乐")):
+        if any(x in lowered for x in ("笑死", "草", "哈哈", "hhh", "233", "乐", "绷不住", "蚌埠住")):
             return "silly"
-        if any(x in lowered for x in ("不是", "怎么", "离谱", "无语", "吐了", "烦")):
+        if any(x in lowered for x in ("不是", "怎么", "离谱", "无语", "吐了", "烦", "逆天", "唐")):
             return "complaint"
-        if any(x in lowered for x in ("因为", "所以", "其实", "比如", "解释", "原理")):
+        if any(x in lowered for x in ("因为", "所以", "其实", "比如", "解释", "原理", "本质", "逻辑")):
             return "serious_explain"
-        if any(x in lowered for x in ("梗", "图", "表情包", "meme", "kusa")):
+        if any(x in lowered for x in ("梗", "图", "表情包", "meme", "kusa", "典", "抽象")):
             return "meme"
-        if any(x in lowered for x in ("是吧", "呵呵", "你猜", "不会吧", "就这")):
+        if any(x in lowered for x in ("是吧", "呵呵", "你猜", "不会吧", "就这", "急了", "赢")):
             return "sarcasm"
         if any(x in lowered for x in ("?", "？", "吗", "呢", "咋")):
             return "banter"

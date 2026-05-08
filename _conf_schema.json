@@ -35,15 +35,67 @@
     "default": 1000,
     "description": "RAG 检索时最多扫描多少条历史发言。"
   },
+  "retrieval_recall_k": {
+    "type": "int",
+    "default": 50,
+    "description": "第一阶段语义召回数量，随后会进行多维 rerank。"
+  },
   "retrieval_cache_ttl_seconds": {
     "type": "int",
     "default": 60,
     "description": "相似发言检索缓存有效期，单位秒。"
   },
+  "embedding_provider": {
+    "type": "string",
+    "default": "placeholder",
+    "description": "embedding provider 类型。",
+    "options": ["placeholder", "openai", "gemini", "ollama", "sentence_transformers", "astrbot"]
+  },
+  "embedding_model": {
+    "type": "string",
+    "default": "BAAI/bge-m3",
+    "description": "embedding 模型名。中文群聊推荐 bge-m3、bge-large-zh-v1.5 或 text-embedding-3-small。"
+  },
+  "embedding_api_key": {
+    "type": "string",
+    "default": "",
+    "description": "OpenAI / Gemini 等远程 embedding 服务的 API Key。",
+    "hint": "使用 Ollama、sentence-transformers、AstrBot provider 时可留空。"
+  },
+  "embedding_api_base": {
+    "type": "string",
+    "default": "",
+    "description": "embedding 服务地址。OpenAI 可填 https://api.openai.com/v1，Ollama 可填 http://127.0.0.1:11434。"
+  },
   "embedding_dimensions": {
     "type": "int",
     "default": 128,
     "description": "placeholder embedding 的向量维度。后续接入真实 embedding provider 时可忽略。"
+  },
+  "astrbot_embedding_provider_id": {
+    "type": "string",
+    "default": "",
+    "description": "当 embedding_provider=astrbot 时，指定 AstrBot embedding provider ID。为空则使用第一个可用 provider。"
+  },
+  "embedding_cache_enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "是否启用内存 embedding cache。"
+  },
+  "embedding_cache_size": {
+    "type": "int",
+    "default": 4096,
+    "description": "内存 embedding cache 最多保存多少条文本向量。"
+  },
+  "embedding_batch_size": {
+    "type": "int",
+    "default": 16,
+    "description": "embedding 队列每批最多处理多少条消息。"
+  },
+  "embedding_batch_flush_seconds": {
+    "type": "float",
+    "default": 0.05,
+    "description": "embedding 队列等待聚合一批消息的最长时间，单位秒。"
   },
   "write_queue_size": {
     "type": "int",

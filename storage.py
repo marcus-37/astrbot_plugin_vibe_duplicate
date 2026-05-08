@@ -10,7 +10,7 @@ from pathlib import Path
 from .models import GeneratedProfile, PendingMessage, StoredMessage
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class AvatarStore:
@@ -97,16 +97,21 @@ class AvatarStore:
             self._ensure_column(conn, "chat_history", "normalized_message", "TEXT")
             self._ensure_column(conn, "chat_history", "message_embedding", "TEXT")
             self._ensure_column(conn, "chat_history", "embedding_model", "TEXT")
+            self._ensure_column(conn, "chat_history", "style_vector", "TEXT")
             self._ensure_column(conn, "chat_history", "semantic_tag", "TEXT")
             self._ensure_column(conn, "chat_history", "quality_score", "REAL DEFAULT 1.0")
+            self._ensure_column(conn, "chat_history", "embedding_status", "TEXT DEFAULT 'ready'")
+            self._ensure_column(conn, "chat_history", "embedded_at", "INTEGER DEFAULT 0")
             self._ensure_column(conn, "generated_profile", "persona_version", "INTEGER NOT NULL DEFAULT 1")
             conn.executescript(
                 """
                 CREATE INDEX IF NOT EXISTS idx_chat_timestamp ON chat_history(timestamp);
                 CREATE INDEX IF NOT EXISTS idx_chat_semantic_tag ON chat_history(semantic_tag);
                 CREATE INDEX IF NOT EXISTS idx_chat_embedding_model ON chat_history(embedding_model);
+                CREATE INDEX IF NOT EXISTS idx_chat_quality_score ON chat_history(quality_score);
+                CREATE INDEX IF NOT EXISTS idx_chat_embedding_status ON chat_history(embedding_status);
                 INSERT OR REPLACE INTO schema_meta(key, value)
-                VALUES('schema_version', '2');
+                VALUES('schema_version', '3');
                 """
             )
 
@@ -132,9 +137,10 @@ class AvatarStore:
                 """
                 INSERT INTO chat_history (
                     user_id, message, normalized_message, timestamp,
-                    message_embedding, embedding_model, semantic_tag, quality_score
+                    message_embedding, embedding_model, style_vector,
+                    semantic_tag, quality_score, embedding_status, embedded_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     pending.user_id,
@@ -143,8 +149,11 @@ class AvatarStore:
                     pending.timestamp,
                     json.dumps(pending.message_embedding, ensure_ascii=False),
                     pending.embedding_model,
+                    json.dumps(pending.style_vector, ensure_ascii=False),
                     pending.semantic_tag,
-                    1.0,
+                    pending.quality_score,
+                    "ready",
+                    int(time.time()),
                 ),
             )
             return int(cursor.lastrowid)
@@ -341,6 +350,7 @@ class AvatarStore:
                 SELECT *
                 FROM chat_history
                 WHERE message_embedding IS NOT NULL AND message_embedding != ''
+                  AND quality_score >= 0.15
                 ORDER BY id DESC
                 LIMIT ?
                 """,
@@ -355,6 +365,12 @@ class AvatarStore:
                 embedding = json.loads(row["message_embedding"])
             except json.JSONDecodeError:
                 embedding = []
+        style_vector: list[float] = []
+        if row["style_vector"]:
+            try:
+                style_vector = json.loads(row["style_vector"])
+            except json.JSONDecodeError:
+                style_vector = []
         return StoredMessage(
             id=int(row["id"]),
             user_id=row["user_id"],
@@ -364,7 +380,61 @@ class AvatarStore:
             semantic_tag=row["semantic_tag"] or "neutral",
             message_embedding=embedding,
             embedding_model=row["embedding_model"] or "",
+            style_vector=style_vector,
+            quality_score=float(row["quality_score"] or 0.0),
         )
+
+    async def update_message_embedding(
+        self,
+        user_id: str,
+        message_id: int,
+        embedding: list[float],
+        embedding_model: str,
+        style_vector: list[float],
+        quality_score: float,
+    ) -> None:
+        await asyncio.to_thread(
+            self._update_message_embedding,
+            user_id,
+            message_id,
+            embedding,
+            embedding_model,
+            style_vector,
+            quality_score,
+        )
+
+    def _update_message_embedding(
+        self,
+        user_id: str,
+        message_id: int,
+        embedding: list[float],
+        embedding_model: str,
+        style_vector: list[float],
+        quality_score: float,
+    ) -> None:
+        db_path = self.db_path(user_id)
+        self._init_db(db_path)
+        with closing(self._connect(db_path)) as conn:
+            conn.execute(
+                """
+                UPDATE chat_history
+                SET message_embedding = ?,
+                    embedding_model = ?,
+                    style_vector = ?,
+                    quality_score = ?,
+                    embedding_status = 'ready',
+                    embedded_at = ?
+                WHERE id = ?
+                """,
+                (
+                    json.dumps(embedding, ensure_ascii=False),
+                    embedding_model,
+                    json.dumps(style_vector, ensure_ascii=False),
+                    quality_score,
+                    int(time.time()),
+                    message_id,
+                ),
+            )
 
     async def profile_items(self, user_id: str) -> dict[str, str]:
         return await asyncio.to_thread(self._profile_items, user_id)
