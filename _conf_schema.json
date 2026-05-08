@@ -1,8 +1,9 @@
 {
   "target_users": {
-    "type": "template_list",
+    "type": "list",
     "default": [],
-    "description": "需要长期学习的目标用户 ID 列表。"
+    "description": "需要长期学习的目标用户 ID 列表。",
+    "hint": "逐条添加用户 ID，例如 QQ 号或平台返回的 sender_id。"
   },
   "avatar_user_id": {
     "type": "string",
@@ -60,9 +61,10 @@
     "description": "短于该长度的消息不进入学习。"
   },
   "blacklist_words": {
-    "type": "template_list",
+    "type": "list",
     "default": [],
-    "description": "消息包含这些词时不进入学习。"
+    "description": "消息包含这些词时不进入学习。",
+    "hint": "逐条添加关键词；命中任意一个关键词的消息都会被跳过。"
   },
   "filter_commands": {
     "type": "bool",
