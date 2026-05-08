@@ -39,7 +39,7 @@ def cfg(config: AstrBotConfig, key: str, default):
     "https://github.com/oyxning/astrtbot_plugin_echo_avatar",
 )
 class VibeDuplicatePlugin(Star):
-    def __init__(self, context: Context, config: AstrBotConfig):
+    def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
         self.context = context
         self.config = config
