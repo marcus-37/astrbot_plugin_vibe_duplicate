@@ -37,7 +37,7 @@ def cfg(config: AstrBotConfig, key: str, default):
     "LumineStory",
     "Long-term persona learning with dynamic RAG style injection.",
     VERSION,
-    "https://github.com/oyxning/astrtbot_plugin_echo_avatar",
+    "https://github.com/marcus-37/astrbot_plugin_vibe_duplicate",
 )
 class VibeDuplicatePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):

@@ -88,7 +88,7 @@ class RagRetriever:
         query_tag: str,
         persona_summary: str,
     ) -> list[RetrievedExample]:
-        scored: list[RetrievedExample] = []
+        candidates: list[RetrievedExample] = []
         selected_text_keys: set[str] = set()
         selected_day_buckets: dict[int, int] = {}
 
@@ -97,8 +97,6 @@ class RagRetriever:
             style_score = self.style_analyzer.style_similarity(query_style_vector, item.style_vector)
             tag_score = self._semantic_tag_score(query_tag, item.semantic_tag)
             persona_score = self._persona_score(item, persona_summary)
-            repetition_penalty = self._repetition_penalty(item.normalized_message, selected_text_keys)
-            temporal_penalty = self._temporal_penalty(item.timestamp, selected_day_buckets)
             spam_penalty = 0.5 if item.quality_score < 0.25 else 1.0
             final_score = (
                 semantic_score * 0.50
@@ -108,13 +106,13 @@ class RagRetriever:
             )
             final_score *= 0.75 + item.quality_score * 0.25
             final_score *= 0.9 + persona_score * 0.1
-            final_score *= repetition_penalty * temporal_penalty * spam_penalty
+            final_score *= spam_penalty
             style_brief = self.style_analyzer.style_brief(
                 item.normalized_message,
                 item.semantic_tag,
                 item.style_vector,
             )
-            scored.append(
+            candidates.append(
                 RetrievedExample(
                     message=item.normalized_message,
                     semantic_tag=item.semantic_tag,
@@ -128,12 +126,27 @@ class RagRetriever:
                     style_brief=style_brief,
                 ),
             )
-            selected_text_keys.add(self._text_key(item.normalized_message))
-            day = item.timestamp // 86400
+
+        selected: list[RetrievedExample] = []
+        remaining = candidates[:]
+        while remaining:
+            best_index = 0
+            best_score = -1.0
+            for index, candidate in enumerate(remaining):
+                adjusted = candidate.score
+                adjusted *= self._repetition_penalty(candidate.message, selected_text_keys)
+                adjusted *= self._temporal_penalty(candidate.timestamp, selected_day_buckets)
+                if adjusted > best_score:
+                    best_score = adjusted
+                    best_index = index
+            chosen = remaining.pop(best_index)
+            chosen.score = best_score
+            selected.append(chosen)
+            selected_text_keys.add(self._text_key(chosen.message))
+            day = chosen.timestamp // 86400
             selected_day_buckets[day] = selected_day_buckets.get(day, 0) + 1
 
-        scored.sort(key=lambda item: (item.score, item.quality_score, item.timestamp), reverse=True)
-        return scored
+        return selected
 
     def _semantic_tag_score(self, query_tag: str, item_tag: str) -> float:
         if not query_tag or query_tag == "neutral":
@@ -179,4 +192,3 @@ class RagRetriever:
         digest = hashlib.blake2b(query.encode("utf-8"), digest_size=12).hexdigest()
         version = profile.persona_version if profile else 0
         return f"rag:v3:{self.embedding_provider.model_name}:{top_k}:{version}:{digest}"
-

@@ -109,14 +109,34 @@ class GeminiEmbeddingProvider(BaseEmbeddingProvider):
         self.timeout = timeout
 
     async def embed_many(self, texts: list[str]) -> list[EmbeddingResult]:
-        results = []
+        if not texts:
+            return []
+        url = f"{self.base_url}/models/{self.model_name}:batchEmbedContents?key={self.api_key}"
+        model_ref = f"models/{self.model_name}"
+        payload = {
+            "requests": [
+                {
+                    "model": model_ref,
+                    "content": {"parts": [{"text": text}]},
+                }
+                for text in texts
+            ],
+        }
+        try:
+            data = await asyncio.to_thread(post_json, url, payload, {}, self.timeout)
+            vectors = [item["values"] for item in data["embeddings"]]
+        except Exception:
+            vectors = await self._embed_one_by_one(texts)
+        return [EmbeddingResult(normalize_vector(vector), self.model_name) for vector in vectors]
+
+    async def _embed_one_by_one(self, texts: list[str]) -> list[list[float]]:
+        vectors = []
         for text in texts:
             url = f"{self.base_url}/models/{self.model_name}:embedContent?key={self.api_key}"
             payload = {"content": {"parts": [{"text": text}]}}
             data = await asyncio.to_thread(post_json, url, payload, {}, self.timeout)
-            vector = data["embedding"]["values"]
-            results.append(EmbeddingResult(normalize_vector(vector), self.model_name))
-        return results
+            vectors.append(data["embedding"]["values"])
+        return vectors
 
 
 class OllamaEmbeddingProvider(BaseEmbeddingProvider):
