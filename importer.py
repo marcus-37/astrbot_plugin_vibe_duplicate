@@ -14,6 +14,9 @@ TEXT_LINE_RE = re.compile(
     r"^\s*(?:\[?(?P<time>\d{4}[-/]\d{1,2}[-/]\d{1,2}[ T]\d{1,2}:\d{2}(?::\d{2})?)\]?\s+)?"
     r"(?:(?P<sender>[^:：]{1,48})[:：]\s*)?(?P<text>.+?)\s*$"
 )
+MEDIA_PLACEHOLDER_RE = re.compile(
+    r"^(?:\[(?:图片|语音|视频|文件|转发消息|表情)[^\]]*\]|\[卡片消息:.*\])$"
+)
 
 
 @dataclass(slots=True)
@@ -22,6 +25,7 @@ class ImportedMessage:
     timestamp: int
     sender_id: str = ""
     sender_name: str = ""
+    sender_keys: tuple[str, ...] = ()
 
 
 def load_chat_records(path: Path) -> list[ImportedMessage]:
@@ -139,10 +143,15 @@ def _load_csv(path: Path) -> list[ImportedMessage]:
 
 def _record_from_mapping(item: dict[str, Any]) -> ImportedMessage:
     text = _first_text(item, ("message", "text", "content", "message_str", "raw_message"))
-    sender_id = str(_first_text(item, ("sender_id", "user_id", "sender", "qq", "uid"))).strip()
-    sender_name = str(_first_text(item, ("sender_name", "nickname", "name"))).strip()
+    sender_id, sender_name, sender_keys = _sender_identity(item)
     timestamp = parse_timestamp(_first_text(item, ("timestamp", "time", "created_at", "date")))
-    return ImportedMessage(text=text.strip(), timestamp=timestamp, sender_id=sender_id, sender_name=sender_name)
+    return ImportedMessage(
+        text=_normalize_exported_text(text),
+        timestamp=timestamp,
+        sender_id=sender_id,
+        sender_name=sender_name,
+        sender_keys=sender_keys,
+    )
 
 
 def _first_text(item: dict[str, Any], keys: tuple[str, ...]) -> str:
@@ -161,6 +170,40 @@ def _first_text(item: dict[str, Any], keys: tuple[str, ...]) -> str:
     return ""
 
 
+def _sender_identity(item: dict[str, Any]) -> tuple[str, str, tuple[str, ...]]:
+    sender = item.get("sender")
+    values: list[str] = []
+    sender_name = ""
+    sender_keys = item.get("sender_keys")
+    if isinstance(sender_keys, list):
+        values.extend(str(value).strip() for value in sender_keys if value is not None)
+    if isinstance(sender, dict):
+        for key in ("uid", "uin", "user_id", "sender_id", "qq", "id", "name", "nickname"):
+            value = sender.get(key)
+            if value is not None:
+                values.append(str(value).strip())
+        sender_name = str(sender.get("name") or sender.get("nickname") or "").strip()
+    else:
+        for key in ("sender_id", "user_id", "qq", "uid", "uin", "sender"):
+            value = item.get(key)
+            if value is not None:
+                values.append(str(value).strip())
+        sender_name = str(item.get("sender_name") or item.get("nickname") or item.get("name") or "").strip()
+
+    if sender_name:
+        values.append(sender_name)
+    values = [value for value in values if value]
+    sender_id = values[0] if values else ""
+    return sender_id, sender_name, tuple(dict.fromkeys(values))
+
+
+def _normalize_exported_text(text: str) -> str:
+    text = (text or "").strip()
+    if MEDIA_PLACEHOLDER_RE.fullmatch(text):
+        return ""
+    return text
+
+
 def _part_text(part: Any) -> str:
     if isinstance(part, str):
         return part
@@ -168,6 +211,9 @@ def _part_text(part: Any) -> str:
         return ""
     part_type = str(part.get("type", "")).lower()
     if part_type in {"plain", "text"}:
+        data = part.get("data")
+        if isinstance(data, dict) and isinstance(data.get("text"), str):
+            return data["text"]
         return str(part.get("text") or part.get("content") or "")
     if part_type == "reply":
         selected = str(part.get("selected_text") or "")

@@ -101,7 +101,6 @@ final_score =
 
 同时保留了旧命令组别名 `/echo_avatar`，作用与 `/duplicate` 相同。
 
-
 ## 快速导入聊天记录
 
 有两种方式可以快速形成基础人格库：
@@ -130,7 +129,7 @@ final_score =
 /duplicate import <目标用户ID> <文件路径>
 ```
 
-支持 `.txt`、`.json`、`.jsonl`、`.csv`。相对路径会按插件目录解析，绝对路径也可用。常见字段名会自动识别，例如 `message`、`text`、`content`、`message_str`、`sender_id`、`user_id`、`timestamp`、`created_at`。
+支持 `.txt`、`.json`、`.jsonl`、`.csv`。相对路径会按插件目录解析，绝对路径也可用。常见字段名会自动识别，例如 `message`、`text`、`content`、`message_str`、`sender_id`、`user_id`、`timestamp`、`created_at`。也支持 QQChatExporter V5 这类 `messages[].sender.uid / uin / name` + `content.text` 的导出结构；导入时可以用目标用户的 `uid`、QQ 号 `uin` 或名称作为 `<目标用户ID>`，插件会自动只导入匹配发送者的文本消息。
 
 普通文本每行一条消息，也支持下面这种格式：
 

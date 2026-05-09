@@ -459,6 +459,14 @@ class VibeDuplicatePlugin(Star):
                         timestamp=timestamp,
                         sender_id=sender_id,
                         sender_name=str(getattr(item, "sender_name", "") or ""),
+                        sender_keys=tuple(
+                            value
+                            for value in (
+                                sender_id,
+                                str(getattr(item, "sender_name", "") or ""),
+                            )
+                            if value
+                        ),
                     )
                 )
                 if len(records) >= limit:
@@ -481,8 +489,12 @@ class VibeDuplicatePlugin(Star):
         prepared = []
         seen_normalized: set[str] = set()
         duplicate_window = int(cfg(self.config, "import_duplicate_window", 200))
+        should_filter_sender = any(self._imported_sender_keys(record) for record in records)
 
         for record in records:
+            if should_filter_sender and user_id not in self._imported_sender_keys(record):
+                stats.skipped += 1
+                continue
             clean = self.cleaner.clean(record.text)
             if not clean.accepted:
                 stats.skipped += 1
@@ -531,6 +543,13 @@ class VibeDuplicatePlugin(Star):
         if stats.imported:
             await self.persona_updater.update_persona_if_needed(user_id, force=True, umo=umo)
         return stats
+
+    def _imported_sender_keys(self, record: ImportedMessage) -> set[str]:
+        return {
+            str(value).strip()
+            for value in (*record.sender_keys, record.sender_id, record.sender_name)
+            if str(value).strip()
+        }
 
     async def terminate(self):
         if self.writer_task:
