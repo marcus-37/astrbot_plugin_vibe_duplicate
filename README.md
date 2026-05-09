@@ -4,7 +4,7 @@
 
 ## 工作流程
 
-群聊消息 -> 清洗 / 过滤 -> 写入 SQLite -> 生成 placeholder embedding -> 更新 persona -> RAG 检索 -> 动态注入 prompt -> LLM 回复。
+群聊消息 -> 清洗 / 过滤 -> 写入 SQLite -> 生成 embedding -> 更新 persona -> ReplyPlan -> 风格 RAG -> 两阶段 prompt -> LLM 回复。
 
 ## 新目录结构
 
@@ -17,6 +17,7 @@
 - `persona.py`：增量 persona 更新器，带一致性保护和回滚支持。
 - `prompting.py`：avatar prompt 与 persona 更新 prompt 构建器。
 - `importer.py`：聊天记录导入与 AstrBot 历史消息文本提取。
+- `planner.py`：回复规划层，先判断“说什么”，再交给风格改写层决定“怎么说”。
 
 ## 数据库结构重点
 
@@ -40,11 +41,23 @@
 - `retrieval_cache(cache_key, payload, created_at)`
 - `schema_meta(key, value)`
 
+## 两阶段回复链路
+
+运行时回复链路已经改成：
+
+```text
+当前上下文 -> ReplyPlan -> 风格 RAG -> 两阶段 style rewrite prompt -> LLM 回复
+```
+
+`ReplyPlan` 只从当前上下文判断回复内容，不使用历史样本当事实来源。RAG 只检索目标用户的表达节奏、语气、标点、口癖和情绪强度，不能把历史里的事件、人物、观点或结论带进当前回答。
+
+如果当前聊天 provider 可用，插件会先调用一次模型生成 JSON 规划；不可用或失败时会退回规则 planner。可通过 `enable_response_planner_llm` 关闭模型规划。
+
 ## Embedding 与 RAG
 
 `embedding_provider` 支持：
 
-- `placeholder`：无依赖 fallback，只适合测试。
+- `placeholder`：无依赖 fallback，只适合测试，不能用于真实 7k 级别人格库；正式使用请切到 `bge-m3`、OpenAI、Gemini、Ollama 或 AstrBot embedding。
 - `openai`：推荐 `text-embedding-3-small` 或更高模型。
 - `gemini`：推荐 `gemini-embedding-exp-03-07`。
 - `ollama`：本地部署推荐 `bge-m3`。
@@ -53,9 +66,11 @@
 
 检索流程：
 
-1. 先用 semantic embedding 召回 top 50。
-2. 再用多维分数 rerank。
-3. 最终取 top 8 注入 prompt。
+1. 使用 ReplyPlan 的 `style_query` 检索，不直接使用原始用户问题。
+2. 只读取当前 embedding provider `model_name` 对应的 ready embedding。
+3. 当前模型可用样本太少时才 fallback 到全部 ready embedding，并在日志和 debug 输出中标记 fallback。
+4. 先 semantic recall，再多维 rerank。
+5. 最终取 top 8 作为风格证据注入 prompt。
 
 评分公式：
 
@@ -94,6 +109,10 @@ final_score =
 - `/duplicate update <user_id>`：立即强制更新目标用户的 persona 总结。
 - `/duplicate import <user_id> <file_path>`：从导出的聊天记录文件导入目标用户历史发言。
 - `/duplicate backfill <user_id> [limit] [platform_id] [session_id]`：从 AstrBot 已保存的平台消息历史中回填目标用户发言。
+- `/duplicate embedding_status <user_id>`：查看当前 embedding provider 下的向量状态、缺失数量和旧模型数量。
+- `/duplicate reembed <user_id> [limit]`：用当前 provider 分批重建旧模型或缺失的 embedding。
+- `/duplicate reembed_all <user_id>`：重建该用户全部旧模型或缺失的 embedding。
+- `/duplicate debug_retrieval <user_id> <query>`：输出 ReplyPlan、style_query、当前 provider model 和召回样本分数。
 - `/duplicate rollback <user_id>`：回滚到上一版 persona 总结。
 - `/duplicate prompt <user_id> [query]`：预览指定用户当前会被注入给 LLM 的模仿 prompt。
 - `/duplicate preview <user_id>`：查看目标用户已学习消息数、persona 版本和最近标签概览。
@@ -133,6 +152,17 @@ final_score =
 
 `import` 和 `backfill` 会在开始、解析完成、清洗完成、每约 1000 条写入进度、persona 更新和完成时发送回执。如果不是管理员执行，也会直接返回权限不足和当前 `sender_id / role`，方便排查是不是权限问题。
 
+## 切换 embedding 后必须重建
+
+如果你以前用 `placeholder` 导入过大量消息，后来切换到 `bge-m3`、OpenAI、Gemini、Ollama 或 AstrBot provider，请先执行：
+
+```text
+/duplicate embedding_status <目标用户ID>
+/duplicate reembed_all <目标用户ID>
+```
+
+否则旧 placeholder 向量和新 query 向量会混用，召回会随机，表现就是“牛头不对马嘴”。重建不会删除原始消息，也不会改消息时间，只会更新 embedding、style_vector、quality_score、embedding_model 和 embedded_at，并清空 retrieval_cache。
+
 普通文本每行一条消息，也支持下面这种格式：
 
 ```text
@@ -146,8 +176,9 @@ final_score =
 - `target_users`：需要长期学习的目标用户 ID 列表。
 - `avatar_user_id`：注入 prompt 时明确要模仿的用户 ID。如果不设置，且 `target_users` 里只有一个用户，就默认使用该用户。
 - `enable_prompt_injection`：是否启用动态 prompt 注入，默认 `true`。
+- `enable_response_planner_llm`：是否先调用聊天模型生成 ReplyPlan，默认 `true`。
 - `persona_update_threshold`：每累计多少条新消息触发一次 persona 更新，默认 `50`。
-- `rag_top_k`：回复时检索多少条相似历史发言，默认 `8`。
+- `rag_top_k`：回复时检索多少条风格样本，默认 `8`。
 - `retrieval_recall_k`：第一阶段语义召回数量，默认 `50`。
 - `embedding_provider`：embedding provider 类型，默认 `placeholder`。
 - `embedding_model`：embedding 模型名。
@@ -155,6 +186,7 @@ final_score =
 - `embedding_api_base`：远程或本地 embedding 服务地址。
 - `import_batch_size`：导入聊天记录时每批生成多少条 embedding，默认 `64`。
 - `import_duplicate_window`：导入时向最近多少条已学习消息检查重复，默认 `200`。
+- `reembed_batch_size`：重建 embedding 时每批处理多少条消息，默认 `64`。
 - `blacklist_words`：出现这些词时不学习该消息。
 - `filter_commands`：是否过滤命令类消息，默认 `true`。
 

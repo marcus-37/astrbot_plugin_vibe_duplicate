@@ -10,7 +10,7 @@ from pathlib import Path
 from .models import GeneratedProfile, PendingMessage, StoredMessage
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class AvatarStore:
@@ -111,7 +111,7 @@ class AvatarStore:
                 CREATE INDEX IF NOT EXISTS idx_chat_quality_score ON chat_history(quality_score);
                 CREATE INDEX IF NOT EXISTS idx_chat_embedding_status ON chat_history(embedding_status);
                 INSERT OR REPLACE INTO schema_meta(key, value)
-                VALUES('schema_version', '3');
+                VALUES('schema_version', '4');
                 """
             )
 
@@ -338,25 +338,141 @@ class AvatarStore:
             ).fetchall()
         return [self._row_to_message(row) for row in reversed(rows)]
 
-    async def messages_for_retrieval(self, user_id: str, limit: int = 1000) -> list[StoredMessage]:
-        return await asyncio.to_thread(self._messages_for_retrieval, user_id, limit)
+    async def messages_for_retrieval(
+        self,
+        user_id: str,
+        limit: int = 1000,
+        embedding_model: str | None = None,
+    ) -> list[StoredMessage]:
+        return await asyncio.to_thread(
+            self._messages_for_retrieval,
+            user_id,
+            limit,
+            embedding_model,
+        )
 
-    def _messages_for_retrieval(self, user_id: str, limit: int) -> list[StoredMessage]:
+    def _messages_for_retrieval(
+        self,
+        user_id: str,
+        limit: int,
+        embedding_model: str | None,
+    ) -> list[StoredMessage]:
         db_path = self.db_path(user_id)
         self._init_db(db_path)
         with closing(self._connect(db_path)) as conn:
-            rows = conn.execute(
-                """
-                SELECT *
-                FROM chat_history
-                WHERE message_embedding IS NOT NULL AND message_embedding != ''
-                  AND quality_score >= 0.15
-                ORDER BY id DESC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
+            if embedding_model:
+                rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM chat_history
+                    WHERE message_embedding IS NOT NULL AND message_embedding != ''
+                      AND embedding_status = 'ready'
+                      AND embedding_model = ?
+                      AND quality_score >= 0.15
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (embedding_model, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM chat_history
+                    WHERE message_embedding IS NOT NULL AND message_embedding != ''
+                      AND embedding_status = 'ready'
+                      AND quality_score >= 0.15
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
         return [self._row_to_message(row) for row in rows]
+
+    async def embedding_status(self, user_id: str, current_model: str) -> dict[str, int | str]:
+        return await asyncio.to_thread(self._embedding_status, user_id, current_model)
+
+    def _embedding_status(self, user_id: str, current_model: str) -> dict[str, int | str]:
+        db_path = self.db_path(user_id)
+        self._init_db(db_path)
+        with closing(self._connect(db_path)) as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN embedding_status = 'ready'
+                              AND message_embedding IS NOT NULL
+                              AND message_embedding != '' THEN 1 ELSE 0 END) AS ready,
+                    SUM(CASE WHEN embedding_status = 'ready'
+                              AND embedding_model = ?
+                              AND message_embedding IS NOT NULL
+                              AND message_embedding != '' THEN 1 ELSE 0 END) AS current_model_count,
+                    SUM(CASE WHEN embedding_status = 'ready'
+                              AND COALESCE(embedding_model, '') != ?
+                              AND message_embedding IS NOT NULL
+                              AND message_embedding != '' THEN 1 ELSE 0 END) AS other_model_count,
+                    SUM(CASE WHEN message_embedding IS NULL
+                              OR message_embedding = ''
+                              OR embedding_status != 'ready' THEN 1 ELSE 0 END) AS missing_embedding_count
+                FROM chat_history
+                """,
+                (current_model, current_model),
+            ).fetchone()
+        return {
+            "total": int(row["total"] or 0),
+            "ready_embeddings": int(row["ready"] or 0),
+            "current_model_count": int(row["current_model_count"] or 0),
+            "other_model_count": int(row["other_model_count"] or 0),
+            "missing_embedding_count": int(row["missing_embedding_count"] or 0),
+            "current_provider_model": current_model,
+        }
+
+    async def messages_needing_reembed(
+        self,
+        user_id: str,
+        current_model: str,
+        limit: int | None = None,
+    ) -> list[StoredMessage]:
+        return await asyncio.to_thread(
+            self._messages_needing_reembed,
+            user_id,
+            current_model,
+            limit,
+        )
+
+    def _messages_needing_reembed(
+        self,
+        user_id: str,
+        current_model: str,
+        limit: int | None,
+    ) -> list[StoredMessage]:
+        db_path = self.db_path(user_id)
+        self._init_db(db_path)
+        sql = """
+            SELECT *
+            FROM chat_history
+            WHERE COALESCE(embedding_model, '') != ?
+               OR COALESCE(embedding_status, '') != 'ready'
+               OR message_embedding IS NULL
+               OR message_embedding = ''
+            ORDER BY id ASC
+        """
+        params: tuple[object, ...] = (current_model,)
+        if limit is not None and limit > 0:
+            sql += " LIMIT ?"
+            params = (current_model, int(limit))
+        with closing(self._connect(db_path)) as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [self._row_to_message(row) for row in rows]
+
+    async def clear_retrieval_cache(self, user_id: str) -> None:
+        await asyncio.to_thread(self._clear_retrieval_cache, user_id)
+
+    def _clear_retrieval_cache(self, user_id: str) -> None:
+        db_path = self.db_path(user_id)
+        self._init_db(db_path)
+        with closing(self._connect(db_path)) as conn:
+            conn.execute("DELETE FROM retrieval_cache")
 
     def _row_to_message(self, row: sqlite3.Row) -> StoredMessage:
         embedding: list[float] = []
@@ -392,6 +508,7 @@ class AvatarStore:
         embedding_model: str,
         style_vector: list[float],
         quality_score: float,
+        semantic_tag: str | None = None,
     ) -> None:
         await asyncio.to_thread(
             self._update_message_embedding,
@@ -401,6 +518,7 @@ class AvatarStore:
             embedding_model,
             style_vector,
             quality_score,
+            semantic_tag,
         )
 
     def _update_message_embedding(
@@ -411,6 +529,7 @@ class AvatarStore:
         embedding_model: str,
         style_vector: list[float],
         quality_score: float,
+        semantic_tag: str | None,
     ) -> None:
         db_path = self.db_path(user_id)
         self._init_db(db_path)
@@ -422,6 +541,7 @@ class AvatarStore:
                     embedding_model = ?,
                     style_vector = ?,
                     quality_score = ?,
+                    semantic_tag = COALESCE(?, semantic_tag),
                     embedding_status = 'ready',
                     embedded_at = ?
                 WHERE id = ?
@@ -431,6 +551,7 @@ class AvatarStore:
                     embedding_model,
                     json.dumps(style_vector, ensure_ascii=False),
                     quality_score,
+                    semantic_tag,
                     int(time.time()),
                     message_id,
                 ),

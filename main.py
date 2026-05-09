@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
@@ -16,7 +17,8 @@ from .embeddings import EmbeddingQueue, build_embedding_provider
 from .importer import ImportedMessage, extract_history_text, load_chat_records
 from .models import PendingMessage
 from .persona import PersonaUpdater
-from .prompting import build_avatar_prompt
+from .planner import ResponsePlanner
+from .prompting import build_two_stage_avatar_prompt
 from .rag import RagRetriever
 from .storage import AvatarStore
 from .style import StyleAnalyzer
@@ -69,6 +71,7 @@ class VibeDuplicatePlugin(Star):
             filter_commands=bool(cfg(config, "filter_commands", True)),
         )
         self.classifier = StyleClassifier()
+        self.planner = ResponsePlanner(self.classifier)
         self.style_analyzer = StyleAnalyzer()
         self.retriever = RagRetriever(
             self.store,
@@ -163,24 +166,41 @@ class VibeDuplicatePlugin(Star):
 
         current_context = self._current_context(event, request)
         profile = await self.store.get_generated_profile(user_id)
-        query_tag = self.classifier.classify(current_context or request.prompt or "")
-        examples = await self.retriever.retrieve(
-            user_id,
-            current_context or request.prompt or "",
-            top_k=int(cfg(self.config, "rag_top_k", 8)),
-            profile=profile,
-            query_tag=query_tag,
-        )
         annotations = await self.store.notes(user_id, "admin_annotations", 20)
         memories = await self.store.notes(user_id, "third_party_memories", 20)
+        planner_provider = None
+        if bool(cfg(self.config, "enable_response_planner_llm", True)):
+            try:
+                planner_provider = self.context.get_using_provider(event.unified_msg_origin)
+            except Exception as exc:
+                logger.warning("[VibeDuplicate] planner provider unavailable: %s", exc)
+        reply_plan = await self.planner.build_plan(
+            current_context=current_context,
+            prompt=request.prompt,
+            contexts=request.contexts or [],
+            persona_summary=profile.persona_summary if profile else "",
+            admin_annotations=annotations,
+            provider=planner_provider,
+        )
+        if not reply_plan.should_reply:
+            logger.debug("[VibeDuplicate] planner suggested no reply for %s; keeping two-stage constraints", user_id)
+
+        examples = await self.retriever.retrieve_for_style(
+            user_id,
+            reply_plan.style_query,
+            top_k=int(cfg(self.config, "rag_top_k", 8)),
+            profile=profile,
+            target_style_tag=reply_plan.target_style_tag,
+        )
         recent = await self.store.recent_messages(
             user_id,
             int(cfg(self.config, "recent_user_context", 12)),
         )
-        avatar_prompt = build_avatar_prompt(
+        avatar_prompt = build_two_stage_avatar_prompt(
             user_id=user_id,
+            reply_plan=reply_plan,
             profile=profile,
-            similar_examples=examples,
+            style_examples=examples,
             current_context=current_context,
             admin_annotations=annotations,
             third_party_memories=memories,
@@ -205,8 +225,12 @@ class VibeDuplicatePlugin(Star):
     def _current_context(self, event: AstrMessageEvent, request: ProviderRequest) -> str:
         parts: list[str] = []
         for ctx in (request.contexts or [])[-6:]:
-            role = ctx.get("role", "unknown")
-            content = ctx.get("content", "")
+            if isinstance(ctx, dict):
+                role = ctx.get("role", "unknown")
+                content = ctx.get("content", "")
+            else:
+                role = getattr(ctx, "role", "unknown")
+                content = getattr(ctx, "content", "")
             if isinstance(content, str) and content.strip():
                 parts.append(f"{role}: {content.strip()}")
         if request.prompt:
@@ -263,6 +287,100 @@ class VibeDuplicatePlugin(Star):
         yield event.plain_result(
             f"Persona update {'completed' if ok else 'skipped'} for {user_id}."
         )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @duplicate_group.command("embedding_status")
+    async def embedding_status(self, event: AstrMessageEvent, user_id: str):
+        status = await self.store.embedding_status(user_id, self.embedding_provider.model_name)
+        yield event.plain_result(
+            "[VibeDuplicate embedding status]\n"
+            f"user_id: {user_id}\n"
+            f"total messages: {status['total']}\n"
+            f"ready embeddings: {status['ready_embeddings']}\n"
+            f"current_model_count: {status['current_model_count']}\n"
+            f"other_model_count: {status['other_model_count']}\n"
+            f"missing_embedding_count: {status['missing_embedding_count']}\n"
+            f"current provider model_name: {status['current_provider_model']}"
+        )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @duplicate_group.command("reembed")
+    async def reembed(self, event: AstrMessageEvent, user_id: str, limit: int = 500):
+        limit = max(1, int(limit))
+        messages = await self.store.messages_needing_reembed(
+            user_id,
+            self.embedding_provider.model_name,
+            limit=limit,
+        )
+        yield event.plain_result(
+            "[VibeDuplicate] 开始重建 embedding。\n"
+            f"user_id: {user_id}\n"
+            f"current_model: {self.embedding_provider.model_name}\n"
+            f"limit: {limit}\n"
+            f"待处理: {len(messages)}"
+        )
+        async for update in self._reembed_messages_with_progress(user_id, messages):
+            yield event.plain_result(update)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @duplicate_group.command("reembed_all")
+    async def reembed_all(self, event: AstrMessageEvent, user_id: str):
+        messages = await self.store.messages_needing_reembed(
+            user_id,
+            self.embedding_provider.model_name,
+            limit=None,
+        )
+        yield event.plain_result(
+            "[VibeDuplicate] 开始重建全部旧/缺失 embedding。\n"
+            f"user_id: {user_id}\n"
+            f"current_model: {self.embedding_provider.model_name}\n"
+            f"待处理: {len(messages)}"
+        )
+        async for update in self._reembed_messages_with_progress(user_id, messages):
+            yield event.plain_result(update)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @duplicate_group.command("debug_retrieval")
+    async def debug_retrieval(self, event: AstrMessageEvent, user_id: str, *, query: str):
+        profile = await self.store.get_generated_profile(user_id)
+        annotations = await self.store.notes(user_id, "admin_annotations", 20)
+        provider = None
+        if bool(cfg(self.config, "enable_response_planner_llm", True)):
+            try:
+                provider = self.context.get_using_provider(event.unified_msg_origin)
+            except Exception:
+                provider = None
+        plan = await self.planner.build_plan(
+            current_context=query,
+            prompt=query,
+            contexts=[],
+            persona_summary=profile.persona_summary if profile else "",
+            admin_annotations=annotations,
+            provider=provider,
+        )
+        examples = await self.retriever.retrieve_for_style(
+            user_id,
+            plan.style_query,
+            target_style_tag=plan.target_style_tag,
+            profile=profile,
+            top_k=int(cfg(self.config, "rag_top_k", 8)),
+        )
+        lines = [
+            "[VibeDuplicate debug retrieval]",
+            f"provider_model: {self.embedding_provider.model_name}",
+            f"ReplyPlan: {json.dumps(asdict(plan), ensure_ascii=False)}",
+            f"style_query: {plan.style_query}",
+            f"target_style_tag: {plan.target_style_tag}",
+            "examples:",
+        ]
+        for index, item in enumerate(examples, 1):
+            lines.append(
+                f"{index}. final={item.score:.3f} semantic={item.semantic_score:.3f} "
+                f"style={item.style_match_score:.3f} quality={item.quality_score:.3f} "
+                f"model={item.embedding_model or 'unknown'} fallback={item.retrieval_fallback} "
+                f"tag={item.semantic_tag} :: {item.message[:160]}"
+            )
+        yield event.plain_result("\n".join(lines)[:3500])
 
     @duplicate_group.command("import")
     async def import_chat_file(self, event: AstrMessageEvent, user_id: str, *, file_path: str):
@@ -404,21 +522,30 @@ class VibeDuplicatePlugin(Star):
     async def show_prompt(self, event: AstrMessageEvent, user_id: str, *, query: str = ""):
         profile = await self.store.get_generated_profile(user_id)
         query_text = query or event.message_str
-        examples = await self.retriever.retrieve(
-            user_id,
-            query_text,
-            top_k=8,
-            profile=profile,
-            query_tag=self.classifier.classify(query_text),
-        )
         annotations = await self.store.notes(user_id, "admin_annotations", 20)
         memories = await self.store.notes(user_id, "third_party_memories", 20)
-        recent = await self.store.recent_messages(user_id, 12)
-        prompt = build_avatar_prompt(
-            user_id=user_id,
+        plan = await self.planner.build_plan(
+            current_context=query_text,
+            prompt=query_text,
+            contexts=[],
+            persona_summary=profile.persona_summary if profile else "",
+            admin_annotations=annotations,
+            provider=None,
+        )
+        examples = await self.retriever.retrieve_for_style(
+            user_id,
+            plan.style_query,
+            top_k=8,
             profile=profile,
-            similar_examples=examples,
-            current_context=query,
+            target_style_tag=plan.target_style_tag,
+        )
+        recent = await self.store.recent_messages(user_id, 12)
+        prompt = build_two_stage_avatar_prompt(
+            user_id=user_id,
+            reply_plan=plan,
+            profile=profile,
+            style_examples=examples,
+            current_context=query_text,
             admin_annotations=annotations,
             third_party_memories=memories,
             recent_messages=recent,
@@ -636,6 +763,69 @@ class VibeDuplicatePlugin(Star):
             for value in (*record.sender_keys, record.sender_id, record.sender_name)
             if str(value).strip()
         }
+
+    async def _reembed_messages_with_progress(self, user_id: str, messages):
+        if not messages:
+            await self.store.clear_retrieval_cache(user_id)
+            yield "[VibeDuplicate] 没有需要重建的 embedding，已清空检索缓存。"
+            return
+
+        batch_size = max(1, int(cfg(self.config, "reembed_batch_size", cfg(self.config, "import_batch_size", 64))))
+        processed = 0
+        updated = 0
+        failed = 0
+        for start in range(0, len(messages), batch_size):
+            chunk = messages[start : start + batch_size]
+            texts = [item.normalized_message or item.message for item in chunk]
+            try:
+                embeddings = await self.embedding_provider.embed_many(texts)
+            except Exception as exc:
+                failed += len(chunk)
+                processed += len(chunk)
+                logger.error("[VibeDuplicate] reembed batch failed: %s", exc)
+                yield (
+                    "[VibeDuplicate] reembed 批次失败。\n"
+                    f"进度: {processed}/{len(messages)}\n"
+                    f"updated: {updated}\n"
+                    f"failed: {failed}\n"
+                    f"error: {exc}"
+                )
+                continue
+
+            for item, embedding in zip(chunk, embeddings):
+                try:
+                    text = item.normalized_message or item.message
+                    semantic_tag = self.classifier.classify(text)
+                    style_profile = self.style_analyzer.analyze(text, semantic_tag)
+                    await self.store.update_message_embedding(
+                        user_id=user_id,
+                        message_id=item.id,
+                        embedding=embedding.vector,
+                        embedding_model=embedding.model,
+                        style_vector=style_profile.vector,
+                        quality_score=style_profile.quality_score,
+                        semantic_tag=semantic_tag,
+                    )
+                    updated += 1
+                except Exception as exc:
+                    failed += 1
+                    logger.error("[VibeDuplicate] reembed row failed: %s", exc)
+            processed += len(chunk)
+            yield (
+                "[VibeDuplicate] reembed 进行中...\n"
+                f"进度: {processed}/{len(messages)}\n"
+                f"updated: {updated}\n"
+                f"failed: {failed}"
+            )
+
+        await self.store.clear_retrieval_cache(user_id)
+        yield (
+            "[VibeDuplicate] reembed 完成，已清空 retrieval_cache。\n"
+            f"user_id: {user_id}\n"
+            f"updated: {updated}\n"
+            f"failed: {failed}\n"
+            f"current_model: {self.embedding_provider.model_name}"
+        )
 
     async def terminate(self):
         if self.writer_task:

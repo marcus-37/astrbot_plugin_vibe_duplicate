@@ -15,6 +15,11 @@
     "default": true,
     "description": "是否在 LLM 请求前注入 persona、相似历史发言和上下文。"
   },
+  "enable_response_planner_llm": {
+    "type": "bool",
+    "default": true,
+    "description": "是否先调用当前聊天模型生成 ReplyPlan，用来分离“说什么”和“怎么说”。关闭后使用规则 fallback。"
+  },
   "persona_update_threshold": {
     "type": "int",
     "default": 50,
@@ -23,7 +28,7 @@
   "rag_top_k": {
     "type": "int",
     "default": 8,
-    "description": "回复时检索多少条相似历史发言。"
+    "description": "回复时检索多少条风格样本。历史发言只作为风格证据，不作为事实来源。"
   },
   "recent_user_context": {
     "type": "int",
@@ -48,7 +53,7 @@
   "embedding_provider": {
     "type": "string",
     "default": "placeholder",
-    "description": "embedding provider 类型。",
+    "description": "embedding provider 类型。placeholder 只适合测试，真实大量数据请使用 bge-m3/OpenAI/Gemini/Ollama/AstrBot。",
     "options": ["placeholder", "openai", "gemini", "ollama", "sentence_transformers", "astrbot"]
   },
   "embedding_model": {
@@ -106,6 +111,11 @@
     "type": "int",
     "default": 200,
     "description": "导入聊天记录时，向最近多少条已学习消息检查重复。"
+  },
+  "reembed_batch_size": {
+    "type": "int",
+    "default": 64,
+    "description": "重建 embedding 时每批处理多少条消息。"
   },
   "write_queue_size": {
     "type": "int",

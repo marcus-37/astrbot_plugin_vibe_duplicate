@@ -51,4 +51,18 @@ class RetrievedExample:
     semantic_tag_score: float = 0.0
     quality_score: float = 0.0
     style_brief: str = ""
+    embedding_model: str = ""
+    retrieval_fallback: bool = False
+
+
+@dataclass(slots=True)
+class ReplyPlan:
+    should_reply: bool
+    reply_intent: str
+    content_summary: str
+    factual_constraints: list[str]
+    uncertainty: str
+    style_query: str
+    target_style_tag: str
+    planner_source: str = "fallback"
 

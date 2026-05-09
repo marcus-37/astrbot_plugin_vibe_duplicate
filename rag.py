@@ -2,8 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from dataclasses import asdict
+
+try:
+    from astrbot.api import logger
+except Exception:  # pragma: no cover - allows standalone smoke tests.
+    logger = logging.getLogger(__name__)
 
 from .embeddings import EmbeddingProvider, cosine_similarity
 from .models import GeneratedProfile, RetrievedExample, StoredMessage
@@ -36,10 +42,27 @@ class RagRetriever:
         profile: GeneratedProfile | None = None,
         query_tag: str = "neutral",
     ) -> list[RetrievedExample]:
-        query = (query or "").strip()
-        if not query:
+        return await self.retrieve_for_style(
+            user_id=user_id,
+            style_query=query,
+            target_style_tag=query_tag,
+            profile=profile,
+            top_k=top_k,
+        )
+
+    async def retrieve_for_style(
+        self,
+        user_id: str,
+        style_query: str,
+        target_style_tag: str = "neutral",
+        profile: GeneratedProfile | None = None,
+        top_k: int = 8,
+    ) -> list[RetrievedExample]:
+        style_query = (style_query or "").strip()
+        if not style_query:
             return []
-        cache_key = self._cache_key(query, top_k, profile)
+        model_name = self.embedding_provider.model_name
+        cache_key = self._cache_key(style_query, top_k, profile, target_style_tag, model_name)
         cached = await self.store.get_cache(user_id, cache_key, self.cache_ttl_seconds)
         if cached:
             try:
@@ -47,15 +70,31 @@ class RagRetriever:
             except (TypeError, json.JSONDecodeError):
                 pass
 
-        query_embedding = (await self.embedding_provider.embed(query)).vector
-        query_style = self.style_analyzer.analyze(query, query_tag)
-        candidates = await self.store.messages_for_retrieval(user_id, self.scan_limit)
+        query_embedding = (await self.embedding_provider.embed(style_query)).vector
+        query_style = self.style_analyzer.analyze(style_query, target_style_tag)
+        candidates = await self.store.messages_for_retrieval(
+            user_id,
+            self.scan_limit,
+            embedding_model=model_name,
+        )
+        fallback = False
+        min_model_candidates = max(top_k, min(self.recall_k, 20))
+        if len(candidates) < min_model_candidates:
+            fallback = True
+            logger.warning(
+                "[VibeDuplicate] only %s retrieval candidates for model `%s`; falling back to all ready embeddings for %s",
+                len(candidates),
+                model_name,
+                user_id,
+            )
+            candidates = await self.store.messages_for_retrieval(user_id, self.scan_limit)
         semantic_recall = self._semantic_recall(candidates, query_embedding)
         reranked = self._rerank(
             semantic_recall,
             query_style.vector,
-            query_tag,
+            target_style_tag,
             profile.persona_summary if profile else "",
+            retrieval_fallback=fallback,
         )
         results = reranked[:top_k]
         await self.store.set_cache(
@@ -87,6 +126,8 @@ class RagRetriever:
         query_style_vector: list[float],
         query_tag: str,
         persona_summary: str,
+        *,
+        retrieval_fallback: bool = False,
     ) -> list[RetrievedExample]:
         candidates: list[RetrievedExample] = []
         selected_text_keys: set[str] = set()
@@ -124,6 +165,8 @@ class RagRetriever:
                     semantic_tag_score=tag_score,
                     quality_score=item.quality_score,
                     style_brief=style_brief,
+                    embedding_model=item.embedding_model,
+                    retrieval_fallback=retrieval_fallback or item.embedding_model != self.embedding_provider.model_name,
                 ),
             )
 
@@ -188,7 +231,15 @@ class RagRetriever:
     def _text_key(self, text: str) -> str:
         return re.sub(r"\s+", "", text.lower())[:48]
 
-    def _cache_key(self, query: str, top_k: int, profile: GeneratedProfile | None) -> str:
-        digest = hashlib.blake2b(query.encode("utf-8"), digest_size=12).hexdigest()
+    def _cache_key(
+        self,
+        query: str,
+        top_k: int,
+        profile: GeneratedProfile | None,
+        query_tag: str = "",
+        embedding_model: str = "",
+    ) -> str:
+        digest = hashlib.blake2b(f"{query_tag}\n{query}".encode("utf-8"), digest_size=12).hexdigest()
         version = profile.persona_version if profile else 0
-        return f"rag:v3:{self.embedding_provider.model_name}:{top_k}:{version}:{digest}"
+        model = embedding_model or self.embedding_provider.model_name
+        return f"rag:v4:{model}:{top_k}:{version}:{digest}"
