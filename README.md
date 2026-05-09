@@ -131,6 +131,8 @@ final_score =
 
 支持 `.txt`、`.json`、`.jsonl`、`.csv`。相对路径会按插件目录解析，绝对路径也可用。常见字段名会自动识别，例如 `message`、`text`、`content`、`message_str`、`sender_id`、`user_id`、`timestamp`、`created_at`。也支持 QQChatExporter V5 这类 `messages[].sender.uid / uin / name` + `content.text` 的导出结构；导入时可以用目标用户的 `uid`、QQ 号 `uin` 或名称作为 `<目标用户ID>`，插件会自动只导入匹配发送者的文本消息。
 
+`import` 和 `backfill` 会在开始、解析完成、清洗完成、每约 1000 条写入进度、persona 更新和完成时发送回执。如果不是管理员执行，也会直接返回权限不足和当前 `sender_id / role`，方便排查是不是权限问题。
+
 普通文本每行一条消息，也支持下面这种格式：
 
 ```text

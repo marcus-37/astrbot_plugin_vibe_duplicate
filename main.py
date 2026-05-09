@@ -264,26 +264,47 @@ class VibeDuplicatePlugin(Star):
             f"Persona update {'completed' if ok else 'skipped'} for {user_id}."
         )
 
-    @filter.permission_type(filter.PermissionType.ADMIN)
     @duplicate_group.command("import")
     async def import_chat_file(self, event: AstrMessageEvent, user_id: str, *, file_path: str):
+        if not event.is_admin():
+            yield event.plain_result(
+                "权限不足：/duplicate import 只能由管理员执行。\n"
+                f"sender_id: {event.get_sender_id()}\n"
+                f"role: {event.role}"
+            )
+            return
+
         path = self._resolve_import_path(file_path)
+        yield event.plain_result(
+            "[VibeDuplicate] 已收到导入命令，开始读取聊天记录。\n"
+            f"user_id: {user_id}\n"
+            f"file: {path}"
+        )
         if not path.exists() or not path.is_file():
             yield event.plain_result(f"找不到聊天记录文件：{path}")
             return
 
         try:
-            records = load_chat_records(path)
+            records = await asyncio.to_thread(load_chat_records, path)
         except Exception as exc:
             logger.error("[VibeDuplicate] import file failed: %s", exc)
             yield event.plain_result(f"导入失败：无法解析 {path.name}。")
             return
 
-        stats = await self._learn_imported_records(
+        yield event.plain_result(
+            "[VibeDuplicate] 聊天记录解析完成，开始清洗、去重和写入。\n"
+            f"读取记录: {len(records)}"
+        )
+        stats = ImportStats(total=len(records))
+        async for update in self._learn_imported_records_with_progress(
             user_id,
             records,
             umo=event.unified_msg_origin,
-        )
+        ):
+            if isinstance(update, ImportStats):
+                stats = update
+            else:
+                yield event.plain_result(update)
         yield event.plain_result(
             "[VibeDuplicate 导入完成]\n"
             f"user_id: {user_id}\n"
@@ -295,7 +316,6 @@ class VibeDuplicatePlugin(Star):
             f"失败: {stats.failed}"
         )
 
-    @filter.permission_type(filter.PermissionType.ADMIN)
     @duplicate_group.command("backfill")
     async def backfill_history(
         self,
@@ -305,6 +325,14 @@ class VibeDuplicatePlugin(Star):
         platform_id: str = "",
         session_id: str = "",
     ):
+        if not event.is_admin():
+            yield event.plain_result(
+                "权限不足：/duplicate backfill 只能由管理员执行。\n"
+                f"sender_id: {event.get_sender_id()}\n"
+                f"role: {event.role}"
+            )
+            return
+
         manager = getattr(self.context, "message_history_manager", None)
         if manager is None or not hasattr(manager, "get"):
             yield event.plain_result("当前 AstrBot 没有可用的 message_history_manager，无法自动回填。")
@@ -313,6 +341,13 @@ class VibeDuplicatePlugin(Star):
         limit = max(1, min(int(limit), 5000))
         platform = platform_id.strip() or event.get_platform_id()
         sessions = self._history_session_candidates(event, session_id)
+        yield event.plain_result(
+            "[VibeDuplicate] 已收到历史回填命令，开始查询 AstrBot 消息历史。\n"
+            f"user_id: {user_id}\n"
+            f"platform_id: {platform}\n"
+            f"candidate_sessions: {', '.join(sessions) or 'none'}\n"
+            f"limit: {limit}"
+        )
         records = []
         used_session = ""
         for candidate in sessions:
@@ -328,11 +363,21 @@ class VibeDuplicatePlugin(Star):
             )
             return
 
-        stats = await self._learn_imported_records(
+        yield event.plain_result(
+            "[VibeDuplicate] 历史记录读取完成，开始清洗、去重和写入。\n"
+            f"session_id: {used_session}\n"
+            f"读取记录: {len(records)}"
+        )
+        stats = ImportStats(total=len(records))
+        async for update in self._learn_imported_records_with_progress(
             user_id,
             records,
             umo=event.unified_msg_origin,
-        )
+        ):
+            if isinstance(update, ImportStats):
+                stats = update
+            else:
+                yield event.plain_result(update)
         yield event.plain_result(
             "[VibeDuplicate 历史回填完成]\n"
             f"user_id: {user_id}\n"
@@ -485,6 +530,23 @@ class VibeDuplicatePlugin(Star):
         umo: str = "",
     ) -> ImportStats:
         stats = ImportStats(total=len(records))
+        async for update in self._learn_imported_records_with_progress(
+            user_id,
+            records,
+            umo=umo,
+        ):
+            if isinstance(update, ImportStats):
+                stats = update
+        return stats
+
+    async def _learn_imported_records_with_progress(
+        self,
+        user_id: str,
+        records: list[ImportedMessage],
+        *,
+        umo: str = "",
+    ):
+        stats = ImportStats(total=len(records))
         await self.store.init_user(user_id)
         prepared = []
         seen_normalized: set[str] = set()
@@ -510,7 +572,17 @@ class VibeDuplicatePlugin(Star):
             style_profile = self.style_analyzer.analyze(clean.normalized, semantic_tag)
             prepared.append((record, clean.normalized, semantic_tag, style_profile))
 
+        yield (
+            "[VibeDuplicate] 清洗完成，开始生成 embedding 并写入数据库。\n"
+            f"读取: {stats.total}\n"
+            f"待写入: {len(prepared)}\n"
+            f"已跳过: {stats.skipped}\n"
+            f"重复: {stats.duplicate}"
+        )
+
         batch_size = max(1, int(cfg(self.config, "import_batch_size", 64)))
+        progress_step = max(batch_size, 1000)
+        next_progress = progress_step
         for start in range(0, len(prepared), batch_size):
             chunk = prepared[start : start + batch_size]
             try:
@@ -540,9 +612,23 @@ class VibeDuplicatePlugin(Star):
                     stats.failed += 1
                     logger.error("[VibeDuplicate] import write failed: %s", exc)
 
+            processed = start + len(chunk)
+            if processed >= next_progress and processed < len(prepared):
+                yield (
+                    "[VibeDuplicate] 导入中...\n"
+                    f"进度: {processed}/{len(prepared)}\n"
+                    f"已写入: {stats.imported}\n"
+                    f"失败: {stats.failed}"
+                )
+                next_progress += progress_step
+
         if stats.imported:
+            yield (
+                "[VibeDuplicate] 消息写入完成，正在更新 persona。\n"
+                f"已写入: {stats.imported}"
+            )
             await self.persona_updater.update_persona_if_needed(user_id, force=True, umo=umo)
-        return stats
+        yield stats
 
     def _imported_sender_keys(self, record: ImportedMessage) -> set[str]:
         return {
