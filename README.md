@@ -118,7 +118,6 @@ final_score =
 - `/duplicate preview <user_id>`：查看目标用户已学习消息数、persona 版本和最近标签概览。
 - `/duplicate clear <user_id>`：清空指定用户的全部学习数据。
 
-同时保留了旧命令组别名 `/echo_avatar`，作用与 `/duplicate` 相同。
 
 ## 快速导入聊天记录
 
