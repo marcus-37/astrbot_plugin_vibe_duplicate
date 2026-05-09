@@ -97,6 +97,16 @@
     "default": 0.05,
     "description": "embedding 队列等待聚合一批消息的最长时间，单位秒。"
   },
+  "import_batch_size": {
+    "type": "int",
+    "default": 64,
+    "description": "导入聊天记录时，每批生成多少条 embedding。"
+  },
+  "import_duplicate_window": {
+    "type": "int",
+    "default": 200,
+    "description": "导入聊天记录时，向最近多少条已学习消息检查重复。"
+  },
   "write_queue_size": {
     "type": "int",
     "default": 1000,

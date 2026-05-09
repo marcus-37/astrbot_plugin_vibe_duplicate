@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
@@ -12,6 +13,7 @@ from astrbot.api.star import Context, Star, register
 
 from .cleaning import MessageCleaner, StyleClassifier
 from .embeddings import EmbeddingQueue, build_embedding_provider
+from .importer import ImportedMessage, extract_history_text, load_chat_records
 from .models import PendingMessage
 from .persona import PersonaUpdater
 from .prompting import build_avatar_prompt
@@ -23,6 +25,15 @@ from .style import StyleAnalyzer
 DISPLAY_NAME = "Vibe Duplicate"
 VERSION = "2.0.0"
 DATA_ROOT = Path("data/astrtbot_plugin_echo_avatar")
+
+
+@dataclass(slots=True)
+class ImportStats:
+    total: int = 0
+    imported: int = 0
+    skipped: int = 0
+    duplicate: int = 0
+    failed: int = 0
 
 
 def cfg(config: AstrBotConfig, key: str, default):
@@ -254,6 +265,87 @@ class VibeDuplicatePlugin(Star):
         )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
+    @duplicate_group.command("import")
+    async def import_chat_file(self, event: AstrMessageEvent, user_id: str, *, file_path: str):
+        path = self._resolve_import_path(file_path)
+        if not path.exists() or not path.is_file():
+            yield event.plain_result(f"找不到聊天记录文件：{path}")
+            return
+
+        try:
+            records = load_chat_records(path)
+        except Exception as exc:
+            logger.error("[VibeDuplicate] import file failed: %s", exc)
+            yield event.plain_result(f"导入失败：无法解析 {path.name}。")
+            return
+
+        stats = await self._learn_imported_records(
+            user_id,
+            records,
+            umo=event.unified_msg_origin,
+        )
+        yield event.plain_result(
+            "[VibeDuplicate 导入完成]\n"
+            f"user_id: {user_id}\n"
+            f"file: {path}\n"
+            f"读取: {stats.total}\n"
+            f"写入: {stats.imported}\n"
+            f"跳过: {stats.skipped}\n"
+            f"重复: {stats.duplicate}\n"
+            f"失败: {stats.failed}"
+        )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @duplicate_group.command("backfill")
+    async def backfill_history(
+        self,
+        event: AstrMessageEvent,
+        user_id: str,
+        limit: int = 500,
+        platform_id: str = "",
+        session_id: str = "",
+    ):
+        manager = getattr(self.context, "message_history_manager", None)
+        if manager is None or not hasattr(manager, "get"):
+            yield event.plain_result("当前 AstrBot 没有可用的 message_history_manager，无法自动回填。")
+            return
+
+        limit = max(1, min(int(limit), 5000))
+        platform = platform_id.strip() or event.get_platform_id()
+        sessions = self._history_session_candidates(event, session_id)
+        records = []
+        used_session = ""
+        for candidate in sessions:
+            records = await self._fetch_history_records(manager, platform, candidate, user_id, limit)
+            if records:
+                used_session = candidate
+                break
+
+        if not records:
+            yield event.plain_result(
+                "没有找到可回填的历史消息。请确认是在目标群/会话里执行，"
+                "或手动指定 platform_id 与 session_id。"
+            )
+            return
+
+        stats = await self._learn_imported_records(
+            user_id,
+            records,
+            umo=event.unified_msg_origin,
+        )
+        yield event.plain_result(
+            "[VibeDuplicate 历史回填完成]\n"
+            f"user_id: {user_id}\n"
+            f"platform_id: {platform}\n"
+            f"session_id: {used_session}\n"
+            f"读取: {stats.total}\n"
+            f"写入: {stats.imported}\n"
+            f"跳过: {stats.skipped}\n"
+            f"重复: {stats.duplicate}\n"
+            f"失败: {stats.failed}"
+        )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @duplicate_group.command("rollback")
     async def rollback_persona(self, event: AstrMessageEvent, user_id: str):
         profile = await self.store.rollback_generated_profile(user_id)
@@ -311,6 +403,134 @@ class VibeDuplicatePlugin(Star):
         yield event.plain_result(
             f"Cleared data for {user_id}." if removed else f"No data found for {user_id}."
         )
+
+    def _resolve_import_path(self, file_path: str) -> Path:
+        text = file_path.strip().strip('"').strip("'")
+        path = Path(text).expanduser()
+        if path.is_absolute():
+            return path.resolve()
+        return (Path(__file__).resolve().parent / path).resolve()
+
+    def _history_session_candidates(self, event: AstrMessageEvent, override: str = "") -> list[str]:
+        candidates = [
+            override.strip(),
+            event.get_session_id(),
+            event.get_group_id(),
+        ]
+        seen: set[str] = set()
+        result: list[str] = []
+        for item in candidates:
+            item = str(item or "").strip()
+            if item and item not in seen:
+                seen.add(item)
+                result.append(item)
+        return result
+
+    async def _fetch_history_records(
+        self,
+        manager,
+        platform_id: str,
+        session_id: str,
+        target_user_id: str,
+        limit: int,
+    ) -> list[ImportedMessage]:
+        records: list[ImportedMessage] = []
+        page = 1
+        page_size = min(200, limit)
+        while len(records) < limit:
+            history_items = await manager.get(platform_id, session_id, page=page, page_size=page_size)
+            if not history_items:
+                break
+            for item in history_items:
+                content = getattr(item, "content", {}) or {}
+                if isinstance(content, dict) and content.get("type") == "bot":
+                    continue
+                sender_id = str(getattr(item, "sender_id", "") or "")
+                if sender_id and sender_id != target_user_id:
+                    continue
+                text = extract_history_text(content)
+                if not text:
+                    continue
+                created_at = getattr(item, "created_at", None)
+                timestamp = int(created_at.timestamp()) if hasattr(created_at, "timestamp") else int(time.time())
+                records.append(
+                    ImportedMessage(
+                        text=text,
+                        timestamp=timestamp,
+                        sender_id=sender_id,
+                        sender_name=str(getattr(item, "sender_name", "") or ""),
+                    )
+                )
+                if len(records) >= limit:
+                    break
+            if len(history_items) < page_size:
+                break
+            page += 1
+        records.sort(key=lambda record: record.timestamp)
+        return records
+
+    async def _learn_imported_records(
+        self,
+        user_id: str,
+        records: list[ImportedMessage],
+        *,
+        umo: str = "",
+    ) -> ImportStats:
+        stats = ImportStats(total=len(records))
+        await self.store.init_user(user_id)
+        prepared = []
+        seen_normalized: set[str] = set()
+        duplicate_window = int(cfg(self.config, "import_duplicate_window", 200))
+
+        for record in records:
+            clean = self.cleaner.clean(record.text)
+            if not clean.accepted:
+                stats.skipped += 1
+                continue
+            if clean.normalized in seen_normalized:
+                stats.duplicate += 1
+                continue
+            if await self.store.is_duplicate_recent(user_id, clean.normalized, duplicate_window):
+                stats.duplicate += 1
+                continue
+            seen_normalized.add(clean.normalized)
+            semantic_tag = self.classifier.classify(clean.normalized)
+            style_profile = self.style_analyzer.analyze(clean.normalized, semantic_tag)
+            prepared.append((record, clean.normalized, semantic_tag, style_profile))
+
+        batch_size = max(1, int(cfg(self.config, "import_batch_size", 64)))
+        for start in range(0, len(prepared), batch_size):
+            chunk = prepared[start : start + batch_size]
+            try:
+                embeddings = await self.embedding_provider.embed_many([item[1] for item in chunk])
+            except Exception as exc:
+                stats.failed += len(chunk)
+                logger.error("[VibeDuplicate] import embedding failed: %s", exc)
+                continue
+
+            for (record, normalized, semantic_tag, style_profile), embedding in zip(chunk, embeddings):
+                try:
+                    await self.store.add_message(
+                        PendingMessage(
+                            user_id=user_id,
+                            message=record.text.strip(),
+                            normalized_message=normalized,
+                            timestamp=record.timestamp,
+                            semantic_tag=semantic_tag,
+                            message_embedding=embedding.vector,
+                            embedding_model=embedding.model,
+                            style_vector=style_profile.vector,
+                            quality_score=style_profile.quality_score,
+                        )
+                    )
+                    stats.imported += 1
+                except Exception as exc:
+                    stats.failed += 1
+                    logger.error("[VibeDuplicate] import write failed: %s", exc)
+
+        if stats.imported:
+            await self.persona_updater.update_persona_if_needed(user_id, force=True, umo=umo)
+        return stats
 
     async def terminate(self):
         if self.writer_task:
