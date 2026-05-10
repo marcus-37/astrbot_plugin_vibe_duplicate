@@ -12,6 +12,7 @@ except Exception:  # pragma: no cover - allows standalone smoke tests.
 
 from .cleaning import StyleClassifier
 from .models import ReplyPlan
+from .runtime_guard import internal_llm_call_guard
 
 
 VALID_INTENTS = {
@@ -65,20 +66,21 @@ class ResponsePlanner:
         persona_summary: str,
         admin_annotations: list[str],
     ) -> ReplyPlan:
-        response = await provider.text_chat(
-            system_prompt=(
-                "You are a reply content planner. Decide what the bot should say next "
-                "from the current chat context only. Do not imitate any target user's style. "
-                "Do not use retrieved history as facts. Return strict JSON only."
-            ),
-            prompt=self._planner_prompt(
-                current_context=current_context,
-                prompt=prompt,
-                contexts=contexts,
-                persona_summary=persona_summary,
-                admin_annotations=admin_annotations,
-            ),
-        )
+        with internal_llm_call_guard():
+            response = await provider.text_chat(
+                system_prompt=(
+                    "You are a reply content planner. Decide what the bot should say next "
+                    "from the current chat context only. Do not imitate any target user's style. "
+                    "Do not use retrieved history as facts. Return strict JSON only."
+                ),
+                prompt=self._planner_prompt(
+                    current_context=current_context,
+                    prompt=prompt,
+                    contexts=contexts,
+                    persona_summary=persona_summary,
+                    admin_annotations=admin_annotations,
+                ),
+            )
         text = getattr(response, "completion_text", "") or ""
         data = _extract_json_object(text)
         return _coerce_plan(data, source="llm")
@@ -113,6 +115,9 @@ class ResponsePlanner:
                     "If context is insufficient, content_summary should express uncertainty or ask for clarification.",
                     "style_query is a short abstract query for finding style examples, not the original user question.",
                     "target_style_tag should be one of complaint, banter, serious_explain, silly, meme, sarcasm, neutral.",
+                    "context_emotion should describe the other user's emotional state in a few words.",
+                    "would_target_reply should judge whether the target user would likely reply: likely, maybe, unlikely.",
+                    "self_check should briefly explain why the planned reply fits or does not fit the target user's likely behavior.",
                 ],
                 "current_context": current_context,
                 "prompt": prompt or "",
@@ -127,6 +132,9 @@ class ResponsePlanner:
                     "uncertainty": "string",
                     "style_query": "string",
                     "target_style_tag": "string",
+                    "context_emotion": "string",
+                    "would_target_reply": "string",
+                    "self_check": "string",
                 },
             },
             ensure_ascii=False,
@@ -135,6 +143,7 @@ class ResponsePlanner:
     def _fallback_plan(self, *, current_context: str, prompt: str | None) -> ReplyPlan:
         text = (prompt or current_context or "").strip()
         tag = self.classifier.classify(text)
+        emotion = _infer_context_emotion(text)
         lowered = text.lower()
         if not text:
             intent = "ask_clarification"
@@ -166,6 +175,9 @@ class ResponsePlanner:
             style_query=f"{intent} {tag} {summary}",
             target_style_tag=tag,
             planner_source="fallback",
+            context_emotion=emotion,
+            would_target_reply="maybe" if intent == "ask_clarification" else "likely",
+            self_check="规则 planner 根据当前文本和风格标签做了保守判断。",
         )
 
 
@@ -212,4 +224,20 @@ def _coerce_plan(data: dict[str, Any], *, source: str) -> ReplyPlan:
         style_query=style_query,
         target_style_tag=tag,
         planner_source=source,
+        context_emotion=str(data.get("context_emotion") or "neutral").strip() or "neutral",
+        would_target_reply=str(data.get("would_target_reply") or "likely").strip() or "likely",
+        self_check=str(data.get("self_check") or "").strip(),
     )
+
+
+def _infer_context_emotion(text: str) -> str:
+    lowered = text.lower()
+    if any(word in text for word in ("哈哈", "笑死", "乐", "绷", "草")):
+        return "playful/amused"
+    if any(word in text for word in ("急", "烦", "气", "崩", "服了", "无语")):
+        return "frustrated"
+    if any(word in text for word in ("难受", "哭", "唉", "寄", "累")):
+        return "down/needs comfort"
+    if any(word in lowered for word in ("why", "how", "what")) or any(mark in text for mark in ("?", "？", "吗", "怎么")):
+        return "curious/uncertain"
+    return "neutral"

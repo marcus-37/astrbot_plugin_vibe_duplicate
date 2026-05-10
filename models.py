@@ -65,4 +65,7 @@ class ReplyPlan:
     style_query: str
     target_style_tag: str
     planner_source: str = "fallback"
+    context_emotion: str = "neutral"
+    would_target_reply: str = "likely"
+    self_check: str = ""
 

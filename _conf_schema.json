@@ -20,6 +20,13 @@
     "default": true,
     "description": "是否先调用当前聊天模型生成 ReplyPlan，用来分离“说什么”和“怎么说”。关闭后使用规则 fallback。"
   },
+  "planner_no_reply_mode": {
+    "type": "string",
+    "default": "brief_ack",
+    "description": "当 ReplyPlan 判断不应该回复时的处理方式。",
+    "hint": "brief_ack 输出极短回应；empty 尽量输出空字符串；ignore 不注入模仿 prompt。",
+    "options": ["brief_ack", "empty", "ignore"]
+  },
   "persona_update_threshold": {
     "type": "int",
     "default": 50,
@@ -49,6 +56,12 @@
     "type": "int",
     "default": 60,
     "description": "相似发言检索缓存有效期，单位秒。"
+  },
+  "allow_cross_model_retrieval_fallback": {
+    "type": "bool",
+    "default": false,
+    "description": "当前 embedding 模型样本不足时，是否允许混用其他模型的旧向量进行检索。正式使用建议保持关闭。",
+    "hint": "切换 embedding provider 后应执行 /duplicate reembed_all <user_id>，不要依赖跨模型 fallback。"
   },
   "embedding_provider": {
     "type": "string",

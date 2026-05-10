@@ -20,6 +20,7 @@ from .persona import PersonaUpdater
 from .planner import ResponsePlanner
 from .prompting import build_two_stage_avatar_prompt
 from .rag import RagRetriever
+from .runtime_guard import internal_llm_call_active
 from .storage import AvatarStore
 from .style import StyleAnalyzer
 
@@ -79,6 +80,9 @@ class VibeDuplicatePlugin(Star):
             cache_ttl_seconds=int(cfg(config, "retrieval_cache_ttl_seconds", 60)),
             scan_limit=int(cfg(config, "retrieval_scan_limit", 1000)),
             recall_k=int(cfg(config, "retrieval_recall_k", 50)),
+            allow_cross_model_retrieval_fallback=bool(
+                cfg(config, "allow_cross_model_retrieval_fallback", False),
+            ),
         )
         self.persona_updater = PersonaUpdater(
             self.store,
@@ -158,6 +162,8 @@ class VibeDuplicatePlugin(Star):
         event: AstrMessageEvent,
         request: ProviderRequest,
     ) -> None:
+        if internal_llm_call_active():
+            return
         if not bool(cfg(self.config, "enable_prompt_injection", True)):
             return
         user_id = self._select_avatar_user(event)
@@ -168,12 +174,7 @@ class VibeDuplicatePlugin(Star):
         profile = await self.store.get_generated_profile(user_id)
         annotations = await self.store.notes(user_id, "admin_annotations", 20)
         memories = await self.store.notes(user_id, "third_party_memories", 20)
-        planner_provider = None
-        if bool(cfg(self.config, "enable_response_planner_llm", True)):
-            try:
-                planner_provider = self.context.get_using_provider(event.unified_msg_origin)
-            except Exception as exc:
-                logger.warning("[VibeDuplicate] planner provider unavailable: %s", exc)
+        planner_provider = self._planner_provider(event)
         reply_plan = await self.planner.build_plan(
             current_context=current_context,
             prompt=request.prompt,
@@ -183,7 +184,10 @@ class VibeDuplicatePlugin(Star):
             provider=planner_provider,
         )
         if not reply_plan.should_reply:
-            logger.debug("[VibeDuplicate] planner suggested no reply for %s; keeping two-stage constraints", user_id)
+            mode = self._planner_no_reply_mode()
+            logger.debug("[VibeDuplicate] planner suggested no reply for %s; mode=%s", user_id, mode)
+            if mode == "ignore":
+                return
 
         examples = await self.retriever.retrieve_for_style(
             user_id,
@@ -205,10 +209,25 @@ class VibeDuplicatePlugin(Star):
             admin_annotations=annotations,
             third_party_memories=memories,
             recent_messages=recent,
+            no_reply_mode=self._planner_no_reply_mode(),
         )
+        old_system_prompt = (getattr(request, "system_prompt", "") or "").strip()
         request.system_prompt = "\n\n".join(
-            part for part in (request.system_prompt.strip(), avatar_prompt) if part
+            part for part in (old_system_prompt, avatar_prompt) if part
         )
+
+    def _planner_provider(self, event: AstrMessageEvent):
+        if not bool(cfg(self.config, "enable_response_planner_llm", True)):
+            return None
+        try:
+            return self.context.get_using_provider(event.unified_msg_origin)
+        except Exception as exc:
+            logger.warning("[VibeDuplicate] planner provider unavailable: %s", exc)
+            return None
+
+    def _planner_no_reply_mode(self) -> str:
+        mode = str(cfg(self.config, "planner_no_reply_mode", "brief_ack") or "brief_ack").strip().lower()
+        return mode if mode in {"brief_ack", "empty", "ignore"} else "brief_ack"
 
     def _select_avatar_user(self, event: AstrMessageEvent) -> str | None:
         configured = str(cfg(self.config, "avatar_user_id", "") or "").strip()
@@ -344,12 +363,8 @@ class VibeDuplicatePlugin(Star):
     async def debug_retrieval(self, event: AstrMessageEvent, user_id: str, *, query: str):
         profile = await self.store.get_generated_profile(user_id)
         annotations = await self.store.notes(user_id, "admin_annotations", 20)
-        provider = None
-        if bool(cfg(self.config, "enable_response_planner_llm", True)):
-            try:
-                provider = self.context.get_using_provider(event.unified_msg_origin)
-            except Exception:
-                provider = None
+        memories = await self.store.notes(user_id, "third_party_memories", 20)
+        provider = self._planner_provider(event)
         plan = await self.planner.build_plan(
             current_context=query,
             prompt=query,
@@ -358,6 +373,7 @@ class VibeDuplicatePlugin(Star):
             admin_annotations=annotations,
             provider=provider,
         )
+        status = await self.store.embedding_status(user_id, self.embedding_provider.model_name)
         examples = await self.retriever.retrieve_for_style(
             user_id,
             plan.style_query,
@@ -365,14 +381,36 @@ class VibeDuplicatePlugin(Star):
             profile=profile,
             top_k=int(cfg(self.config, "rag_top_k", 8)),
         )
+        recent = await self.store.recent_messages(user_id, int(cfg(self.config, "recent_user_context", 12)))
+        prompt = build_two_stage_avatar_prompt(
+            user_id=user_id,
+            reply_plan=plan,
+            profile=profile,
+            style_examples=examples,
+            current_context=query,
+            admin_annotations=annotations,
+            third_party_memories=memories,
+            recent_messages=recent,
+            no_reply_mode=self._planner_no_reply_mode(),
+        )
+        fallback_happened = any(item.retrieval_fallback for item in examples)
+        suggestions = self._debug_suggestions(status, examples, plan)
         lines = [
             "[VibeDuplicate debug retrieval]",
             f"provider_model: {self.embedding_provider.model_name}",
+            f"current_model_count: {status['current_model_count']}",
+            f"other_model_count: {status['other_model_count']}",
+            f"missing_embedding_count: {status['missing_embedding_count']}",
+            f"allow_cross_model_retrieval_fallback: {bool(cfg(self.config, 'allow_cross_model_retrieval_fallback', False))}",
+            f"retrieval_fallback_happened: {fallback_happened}",
+            f"rough_prompt_tokens: {self._rough_tokens(prompt)}",
             f"ReplyPlan: {json.dumps(asdict(plan), ensure_ascii=False)}",
             f"style_query: {plan.style_query}",
             f"target_style_tag: {plan.target_style_tag}",
             "examples:",
         ]
+        if fallback_happened:
+            lines.append("WARNING: 已使用跨模型检索 fallback，建议切换正式模型后执行 /duplicate reembed_all。")
         for index, item in enumerate(examples, 1):
             lines.append(
                 f"{index}. final={item.score:.3f} semantic={item.semantic_score:.3f} "
@@ -380,6 +418,8 @@ class VibeDuplicatePlugin(Star):
                 f"model={item.embedding_model or 'unknown'} fallback={item.retrieval_fallback} "
                 f"tag={item.semantic_tag} :: {item.message[:160]}"
             )
+        lines.append("suggestions:")
+        lines.extend(f"- {item}" for item in suggestions)
         yield event.plain_result("\n".join(lines)[:3500])
 
     @duplicate_group.command("import")
@@ -530,7 +570,7 @@ class VibeDuplicatePlugin(Star):
             contexts=[],
             persona_summary=profile.persona_summary if profile else "",
             admin_annotations=annotations,
-            provider=None,
+            provider=self._planner_provider(event),
         )
         examples = await self.retriever.retrieve_for_style(
             user_id,
@@ -549,8 +589,132 @@ class VibeDuplicatePlugin(Star):
             admin_annotations=annotations,
             third_party_memories=memories,
             recent_messages=recent,
+            no_reply_mode=self._planner_no_reply_mode(),
         )
-        yield event.plain_result(prompt[:3500])
+        header = (
+            "[VibeDuplicate prompt preview]\n"
+            f"planner_source: {plan.planner_source}\n"
+            f"planner_no_reply_mode: {self._planner_no_reply_mode()}\n"
+            f"rough_prompt_tokens: {self._rough_tokens(prompt)}\n\n"
+        )
+        yield event.plain_result((header + prompt)[:3500])
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @duplicate_group.command("eval")
+    async def eval_harness(self, event: AstrMessageEvent, user_id: str, *, file_path: str):
+        path = self._resolve_import_path(file_path)
+        if not path.exists() or not path.is_file():
+            yield event.plain_result(f"找不到 eval JSONL 文件：{path}")
+            return
+
+        try:
+            cases = await asyncio.to_thread(self._load_eval_cases, path)
+        except Exception as exc:
+            yield event.plain_result(f"eval 文件解析失败：{exc}")
+            return
+
+        yield event.plain_result(
+            "[VibeDuplicate eval] 开始离线评估。\n"
+            f"user_id: {user_id}\n"
+            f"file: {path}\n"
+            f"samples: {len(cases)}"
+        )
+        profile = await self.store.get_generated_profile(user_id)
+        annotations = await self.store.notes(user_id, "admin_annotations", 20)
+        memories = await self.store.notes(user_id, "third_party_memories", 20)
+        recent = await self.store.recent_messages(user_id, int(cfg(self.config, "recent_user_context", 12)))
+        provider = self._planner_provider(event)
+
+        debug_rows = []
+        semantic_scores: list[float] = []
+        style_scores: list[float] = []
+        intent_hits = 0
+        style_tag_hits = 0
+        fallback_count = 0
+        empty_examples = 0
+
+        for index, case in enumerate(cases, 1):
+            context = str(case.get("context") or "")
+            expected_intent = str(case.get("expected_intent") or "")
+            expected_style_tag = str(case.get("expected_style_tag") or "")
+            plan = await self.planner.build_plan(
+                current_context=context,
+                prompt=context,
+                contexts=[],
+                persona_summary=profile.persona_summary if profile else "",
+                admin_annotations=annotations,
+                provider=provider,
+            )
+            examples = await self.retriever.retrieve_for_style(
+                user_id,
+                plan.style_query,
+                top_k=int(cfg(self.config, "rag_top_k", 8)),
+                profile=profile,
+                target_style_tag=plan.target_style_tag,
+            )
+            prompt = build_two_stage_avatar_prompt(
+                user_id=user_id,
+                reply_plan=plan,
+                profile=profile,
+                style_examples=examples,
+                current_context=context,
+                admin_annotations=annotations,
+                third_party_memories=memories,
+                recent_messages=recent,
+                no_reply_mode=self._planner_no_reply_mode(),
+            )
+            if expected_intent and plan.reply_intent == expected_intent:
+                intent_hits += 1
+            if expected_style_tag and plan.target_style_tag == expected_style_tag:
+                style_tag_hits += 1
+            if not examples:
+                empty_examples += 1
+            if any(item.retrieval_fallback for item in examples):
+                fallback_count += 1
+            if examples:
+                semantic_scores.append(sum(item.semantic_score for item in examples) / len(examples))
+                style_scores.append(sum(item.style_match_score for item in examples) / len(examples))
+            debug_rows.append(
+                {
+                    "index": index,
+                    "expected_intent": expected_intent,
+                    "actual_intent": plan.reply_intent,
+                    "expected_style_tag": expected_style_tag,
+                    "actual_style_tag": plan.target_style_tag,
+                    "planner_source": plan.planner_source,
+                    "context_emotion": plan.context_emotion,
+                    "would_target_reply": plan.would_target_reply,
+                    "examples": len(examples),
+                    "fallback": any(item.retrieval_fallback for item in examples),
+                    "rough_prompt_tokens": self._rough_tokens(prompt),
+                }
+            )
+
+        total = len(cases)
+        report = {
+            "user_id": user_id,
+            "file": str(path),
+            "total": total,
+            "intent_hit_rate": intent_hits / total if total else 0,
+            "style_tag_hit_rate": style_tag_hits / total if total else 0,
+            "retrieval_fallback_count": fallback_count,
+            "empty_examples_count": empty_examples,
+            "avg_semantic_score": sum(semantic_scores) / len(semantic_scores) if semantic_scores else 0,
+            "avg_style_match_score": sum(style_scores) / len(style_scores) if style_scores else 0,
+            "debug": debug_rows,
+        }
+        report_path = await asyncio.to_thread(self._save_eval_report, user_id, report)
+        yield event.plain_result(
+            "[VibeDuplicate eval 完成]\n"
+            f"total: {total}\n"
+            f"intent_hit_rate: {report['intent_hit_rate']:.2%}\n"
+            f"style_tag_hit_rate: {report['style_tag_hit_rate']:.2%}\n"
+            f"retrieval_fallback_count: {fallback_count}\n"
+            f"empty_examples_count: {empty_examples}\n"
+            f"avg_semantic_score: {report['avg_semantic_score']:.3f}\n"
+            f"avg_style_match_score: {report['avg_style_match_score']:.3f}\n"
+            f"report: {report_path}"
+        )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @duplicate_group.command("preview")
@@ -582,6 +746,42 @@ class VibeDuplicatePlugin(Star):
         if path.is_absolute():
             return path.resolve()
         return (Path(__file__).resolve().parent / path).resolve()
+
+    def _load_eval_cases(self, path: Path) -> list[dict]:
+        cases = []
+        for line_no, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
+            line = line.strip()
+            if not line:
+                continue
+            value = json.loads(line)
+            if not isinstance(value, dict):
+                raise ValueError(f"line {line_no} is not a JSON object")
+            cases.append(value)
+        return cases
+
+    def _save_eval_report(self, user_id: str, report: dict) -> Path:
+        safe_user_id = "".join(ch for ch in user_id if ch.isalnum() or ch in "-_@.") or "unknown"
+        report_dir = DATA_ROOT / "eval_reports"
+        report_dir.mkdir(parents=True, exist_ok=True)
+        path = report_dir / f"eval_{safe_user_id}_{int(time.time())}.json"
+        path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        return path
+
+    def _rough_tokens(self, text: str) -> int:
+        return max(1, len(text) // 4)
+
+    def _debug_suggestions(self, status: dict, examples: list, plan) -> list[str]:
+        suggestions = []
+        current_count = int(status.get("current_model_count", 0) or 0)
+        if current_count < max(int(cfg(self.config, "rag_top_k", 8)), 20):
+            suggestions.append("current_model_count 太少：运行 /duplicate reembed_all <user_id>。")
+        if not examples:
+            suggestions.append("examples 为空：检查 embedding provider、降低质量过滤预期，或先导入更多目标用户文本。")
+        if getattr(plan, "planner_source", "") == "fallback":
+            suggestions.append("planner_source=fallback：检查当前聊天 provider 是否可用，或关闭/修复 planner LLM。")
+        if any(getattr(item, "retrieval_fallback", False) for item in examples):
+            suggestions.append("已触发跨模型 fallback：正式使用建议关闭 fallback 并 reembed_all。")
+        return suggestions or ["当前检索链路没有明显异常。"]
 
     def _history_session_candidates(self, event: AstrMessageEvent, override: str = "") -> list[str]:
         candidates = [

@@ -68,9 +68,10 @@
 
 1. 使用 ReplyPlan 的 `style_query` 检索，不直接使用原始用户问题。
 2. 只读取当前 embedding provider `model_name` 对应的 ready embedding。
-3. 当前模型可用样本太少时才 fallback 到全部 ready embedding，并在日志和 debug 输出中标记 fallback。
-4. 先 semantic recall，再多维 rerank。
-5. 最终取 top 8 作为风格证据注入 prompt。
+3. 当前模型可用样本太少时默认不跨模型 fallback，会返回空 examples 并提示执行 `/duplicate reembed_all <目标用户ID>`。
+4. 只有手动开启 `allow_cross_model_retrieval_fallback` 时，才允许混用其他 embedding 模型的旧向量，并会在日志和 debug 输出中标记 fallback。
+5. 先 semantic recall，再多维 rerank。
+6. 最终取 top 8 作为风格证据注入 prompt。
 
 评分公式：
 
@@ -112,12 +113,14 @@ final_score =
 - `/duplicate embedding_status <user_id>`：查看当前 embedding provider 下的向量状态、缺失数量和旧模型数量。
 - `/duplicate reembed <user_id> [limit]`：用当前 provider 分批重建旧模型或缺失的 embedding。
 - `/duplicate reembed_all <user_id>`：重建该用户全部旧模型或缺失的 embedding。
-- `/duplicate debug_retrieval <user_id> <query>`：输出 ReplyPlan、style_query、当前 provider model 和召回样本分数。
+- `/duplicate debug_retrieval <user_id> <query>`：输出 ReplyPlan、style_query、当前 provider model、向量数量、fallback 状态、prompt 粗略长度、建议动作和召回样本分数。
 - `/duplicate rollback <user_id>`：回滚到上一版 persona 总结。
-- `/duplicate prompt <user_id> [query]`：预览指定用户当前会被注入给 LLM 的模仿 prompt。
+- `/duplicate prompt <user_id> [query]`：预览指定用户当前会被注入给 LLM 的模仿 prompt，并尽量使用真实运行时的 planner provider。
+- `/duplicate eval <user_id> <file_path>`：读取 JSONL 离线跑 planner + retrieval + prompt 构建，保存评估报告。
 - `/duplicate preview <user_id>`：查看目标用户已学习消息数、persona 版本和最近标签概览。
 - `/duplicate clear <user_id>`：清空指定用户的全部学习数据。
 
+`prompt` 用来看“最终注入给模型的系统提示长什么样”；`debug_retrieval` 用来定位“不像/召回错”到底是 planner、embedding、fallback、样本数量还是 rerank 的问题。
 
 ## 快速导入聊天记录
 
@@ -151,6 +154,14 @@ final_score =
 
 `import` 和 `backfill` 会在开始、解析完成、清洗完成、每约 1000 条写入进度、persona 更新和完成时发送回执。如果不是管理员执行，也会直接返回权限不足和当前 `sender_id / role`，方便排查是不是权限问题。
 
+如果只想把 QQChatExporter 的 `chat.json` 清洗成某个 QQ 号的一行一条纯文本，可以用附带工具：
+
+```powershell
+python tools/clean_qq_export_text.py D:\tools\NapCatQCE\contex\chat.json 2024894470 -o 2024894470.txt
+```
+
+工具只输出该发送者的 `content.text`，会自动去掉开头的 `[回复 ...]` 引用前缀，并默认跳过纯图片、卡片、文件、视频等占位消息。需要保留占位消息时加 `--keep-placeholders`。
+
 ## 切换 embedding 后必须重建
 
 如果你以前用 `placeholder` 导入过大量消息，后来切换到 `bge-m3`、OpenAI、Gemini、Ollama 或 AstrBot provider，请先执行：
@@ -160,7 +171,19 @@ final_score =
 /duplicate reembed_all <目标用户ID>
 ```
 
-否则旧 placeholder 向量和新 query 向量会混用，召回会随机，表现就是“牛头不对马嘴”。重建不会删除原始消息，也不会改消息时间，只会更新 embedding、style_vector、quality_score、embedding_model 和 embedded_at，并清空 retrieval_cache。
+默认配置不会混用旧 placeholder 向量和新 query 向量；如果当前模型样本不足，检索会返回空 examples 并提示你重建。不要在正式使用中开启跨模型 fallback，除非只是临时排查。重建不会删除原始消息，也不会改消息时间，只会更新 embedding、style_vector、quality_score、embedding_model 和 embedded_at，并清空 retrieval_cache。
+
+## 离线 eval
+
+`/duplicate eval <目标用户ID> <JSONL路径>` 不会发送群聊回复，只会离线执行 planner、RAG 和 prompt 构建，用来判断问题出在“说什么”还是“怎么模仿”。
+
+JSONL 每行一个样本：
+
+```json
+{"context":"群聊上下文或用户消息","expected_intent":"serious_explain","expected_style_tag":"serious_explain","gold_reply":"目标用户真实回复，可选"}
+```
+
+输出会包含 intent 命中率、style tag 命中率、fallback 次数、空 examples 次数、平均 semantic/style 分数，并把完整 debug 报告保存到 `data/astrtbot_plugin_echo_avatar/eval_reports`。
 
 普通文本每行一条消息，也支持下面这种格式：
 
@@ -176,9 +199,11 @@ final_score =
 - `avatar_user_id`：注入 prompt 时明确要模仿的用户 ID。如果不设置，且 `target_users` 里只有一个用户，就默认使用该用户。
 - `enable_prompt_injection`：是否启用动态 prompt 注入，默认 `true`。
 - `enable_response_planner_llm`：是否先调用聊天模型生成 ReplyPlan，默认 `true`。
+- `planner_no_reply_mode`：当 planner 判断不该回复时的处理方式，默认 `brief_ack`，可选 `brief_ack`、`empty`、`ignore`。
 - `persona_update_threshold`：每累计多少条新消息触发一次 persona 更新，默认 `50`。
 - `rag_top_k`：回复时检索多少条风格样本，默认 `8`。
 - `retrieval_recall_k`：第一阶段语义召回数量，默认 `50`。
+- `allow_cross_model_retrieval_fallback`：是否允许当前模型样本不足时混用其他 embedding 模型，默认 `false`，正式使用建议不要开启。
 - `embedding_provider`：embedding provider 类型，默认 `placeholder`。
 - `embedding_model`：embedding 模型名。
 - `embedding_api_key`：远程 embedding 服务 API Key。

@@ -199,24 +199,40 @@ class AstrBotEmbeddingProvider(BaseEmbeddingProvider):
         providers = self.context.get_all_embedding_providers()
         return providers[0] if providers else None
 
+    def _resolve_model_name(self, provider: Any) -> str:
+        raw_model = ""
+        getter = getattr(provider, "get_model", None)
+        if callable(getter):
+            raw_model = str(getter() or "").strip()
+        if not raw_model:
+            raw_model = str(getattr(provider, "model_name", "") or "").strip()
+        if not raw_model:
+            raw_model = self.provider_id or "default"
+        model_name = raw_model if raw_model.startswith("astrbot:") else f"astrbot:{raw_model}"
+        self.model_name = model_name
+        return model_name
+
     async def embed_many(self, texts: list[str]) -> list[EmbeddingResult]:
         provider = self._resolve_provider()
         if provider is None:
             raise RuntimeError("No AstrBot embedding provider is configured.")
-        model = getattr(provider, "get_model", lambda: self.model_name)() or self.model_name
+        model_name = self._resolve_model_name(provider)
         if hasattr(provider, "get_embeddings"):
             vectors = await provider.get_embeddings(texts)
         else:
             vectors = [await provider.get_embedding(text) for text in texts]
-        return [EmbeddingResult(normalize_vector(vector), f"astrbot:{model}") for vector in vectors]
+        return [EmbeddingResult(normalize_vector(vector), model_name) for vector in vectors]
 
 
 class CachedEmbeddingProvider(BaseEmbeddingProvider):
     def __init__(self, provider: EmbeddingProvider, max_items: int = 4096) -> None:
         self.provider = provider
-        self.model_name = provider.model_name
         self.max_items = max_items
         self._cache: dict[str, EmbeddingResult] = {}
+
+    @property
+    def model_name(self) -> str:
+        return self.provider.model_name
 
     async def embed_many(self, texts: list[str]) -> list[EmbeddingResult]:
         results: list[EmbeddingResult | None] = []

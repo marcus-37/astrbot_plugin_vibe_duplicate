@@ -26,12 +26,14 @@ class RagRetriever:
         cache_ttl_seconds: int = 60,
         scan_limit: int = 1000,
         recall_k: int = 50,
+        allow_cross_model_retrieval_fallback: bool = False,
     ) -> None:
         self.store = store
         self.embedding_provider = embedding_provider
         self.cache_ttl_seconds = cache_ttl_seconds
         self.scan_limit = scan_limit
         self.recall_k = recall_k
+        self.allow_cross_model_retrieval_fallback = allow_cross_model_retrieval_fallback
         self.style_analyzer = StyleAnalyzer()
 
     async def retrieve(
@@ -80,9 +82,19 @@ class RagRetriever:
         fallback = False
         min_model_candidates = max(top_k, min(self.recall_k, 20))
         if len(candidates) < min_model_candidates:
+            if not self.allow_cross_model_retrieval_fallback:
+                logger.warning(
+                    "[VibeDuplicate] only %s retrieval candidates for model `%s`; cross-model fallback disabled for %s. Run `/duplicate reembed_all %s`.",
+                    len(candidates),
+                    model_name,
+                    user_id,
+                    user_id,
+                )
+                await self.store.set_cache(user_id, cache_key, "[]")
+                return []
             fallback = True
             logger.warning(
-                "[VibeDuplicate] only %s retrieval candidates for model `%s`; falling back to all ready embeddings for %s",
+                "[VibeDuplicate] only %s retrieval candidates for model `%s`; cross-model fallback enabled for %s",
                 len(candidates),
                 model_name,
                 user_id,
